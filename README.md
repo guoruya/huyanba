@@ -8,6 +8,11 @@
 - 全屏休息锁屏：多显示器覆盖、倒计时显示
 - 托盘控制：显示/隐藏/立即休息/退出
 
+## 界面截图
+![首页](docs/images/首页.png)
+![功能](docs/images/功能.png)
+![锁屏](docs/images/锁屏.png)
+
 ## 本地开发
 ```
 cd D:\Ai\huyanba\huzamba
