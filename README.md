@@ -9,9 +9,19 @@
 - 托盘控制：显示/隐藏/立即休息/退出
 
 ## 界面截图
+首页（护眼状态概览 + 下一次休息）
 ![首页](docs/images/首页.png)
+
+功能（过滤蓝光强度/色调 + 休息节奏）
 ![功能](docs/images/功能.png)
+
+锁屏（全屏覆盖 + 倒计时）
 ![锁屏](docs/images/锁屏.png)
+
+## 安装包位置（本机）
+```
+D:\Ai\huyanba\huzamba\src-tauri\target\release\bundle\nsis\huyanba_0.1.0_x64-setup.exe
+```
 
 ## 本地开发
 ```
@@ -34,3 +44,43 @@ src-tauri\target\release\bundle
 ## 说明
 - 过滤蓝光通过系统 gamma 曲线实现
 - 锁屏使用全屏覆盖窗口（非系统锁屏）
+
+---
+
+# Huyanba (English)
+
+Desktop eye-care app: blue-light filter + scheduled break lockscreen.
+
+## Features
+- Blue-light filter with strength + tone presets
+- Scheduled breaks (default 30 minutes work / 1 minute rest)
+- Fullscreen rest lockscreen (multi-monitor)
+- Tray controls (show/hide/rest/quit)
+
+## Screenshots
+Home (status + next break)
+![Home](docs/images/首页.png)
+
+Filter & Schedule
+![Features](docs/images/功能.png)
+
+Lockscreen
+![Lockscreen](docs/images/锁屏.png)
+
+## Installer (local path)
+```
+D:\Ai\huyanba\huzamba\src-tauri\target\release\bundle\nsis\huyanba_0.1.0_x64-setup.exe
+```
+
+## Development
+```
+cd D:\Ai\huyanba\huzamba
+npm install
+npm run tauri dev
+```
+
+## Build (Windows)
+```
+cd D:\Ai\huyanba\huzamba
+npm run tauri build
+```
