@@ -1,7 +1,4 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Menu } from "@tauri-apps/api/menu";
-import { TrayIcon } from "@tauri-apps/api/tray";
-import { defaultWindowIcon } from "@tauri-apps/api/app";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
@@ -131,7 +128,21 @@ function App() {
     } else {
       setNextRestAt(null);
     }
-  }, [restEnabled, restMinutes]);
+    if (!isLockWindow) {
+      invoke("set_gamma", {
+        filterEnabled,
+        strength: filterStrength,
+        colorTemp,
+      }).catch(() => undefined);
+    }
+  }, [
+    restEnabled,
+    restMinutes,
+    isLockWindow,
+    filterEnabled,
+    filterStrength,
+    colorTemp,
+  ]);
 
   const handleTogglePause = useCallback(() => {
     if (!showLockScreen) return;
@@ -314,79 +325,6 @@ function App() {
     window.addEventListener("keydown", onKeydown);
     return () => window.removeEventListener("keydown", onKeydown);
   }, [isLockWindow, lockPayload.allowEscExit]);
-
-  useEffect(() => {
-    if (isLockWindow) return;
-    let tray: TrayIcon | null = null;
-    let active = true;
-
-    const setupTray = async () => {
-      try {
-        const menu = await Menu.new({
-          items: [
-            {
-              id: "show",
-              text: "显示主界面",
-              action: async () => {
-                const win = getCurrentWebviewWindow();
-                await win.show();
-                await win.setFocus();
-              },
-            },
-            {
-              id: "rest",
-              text: "立即休息",
-              action: async () => {
-                const win = getCurrentWebviewWindow();
-                await win.show();
-                await win.setFocus();
-                handleStartRest();
-              },
-            },
-            {
-              id: "hide",
-              text: "隐藏到托盘",
-              action: async () => {
-                const win = getCurrentWebviewWindow();
-                await win.hide();
-              },
-            },
-            {
-              id: "quit",
-              text: "退出",
-              action: async () => {
-                const win = getCurrentWebviewWindow();
-                await win.close();
-              },
-            },
-          ],
-        });
-
-        if (!active) return;
-        const icon = await defaultWindowIcon();
-        if (icon) {
-          tray = await TrayIcon.new({
-            icon,
-            tooltip: "护眼吧",
-            menu,
-            menuOnLeftClick: true,
-          });
-        }
-      } catch (error) {
-        console.error("托盘创建失败", error);
-      }
-    };
-
-    setupTray();
-
-    return () => {
-      active = false;
-      if (tray) {
-        tray.close();
-        tray = null;
-      }
-    };
-  }, [handleStartRest, isLockWindow]);
 
   // 全局快捷键已取消
 

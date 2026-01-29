@@ -1,7 +1,14 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
-use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex,
+};
+use tauri::{
+    menu::MenuBuilder,
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent,
+};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Gdi::{GetDC, ReleaseDC};
 use windows::Win32::UI::ColorSystem::SetDeviceGammaRamp;
@@ -11,6 +18,13 @@ struct LockState {
     labels: Mutex<Vec<String>>,
     last_update: Mutex<Option<LockUpdate>>,
 }
+
+#[derive(Default)]
+struct AppState {
+    allow_exit: AtomicBool,
+}
+
+const TRAY_ICON: tauri::image::Image<'static> = tauri::include_image!("icons/32x32.png");
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -141,10 +155,10 @@ async fn show_lock_windows(
         let position = monitor.position();
         let size = monitor.size();
         let scale = monitor.scale_factor();
-        let width = (size.width as f64 / scale).ceil() + 20.0;
-        let height = (size.height as f64 / scale).ceil() + 20.0;
-        let x = (position.x as f64 / scale).floor() - 10.0;
-        let y = (position.y as f64 / scale).floor() - 10.0;
+        let width = (size.width as f64 / scale).ceil() + 400.0;
+        let height = (size.height as f64 / scale).ceil() + 400.0;
+        let x = (position.x as f64 / scale).floor() - 200.0;
+        let y = (position.y as f64 / scale).floor() - 200.0;
 
         let url = format!(
             "index.html?lockscreen=1&end={}&paused={}&remaining={}&allowEsc={}",
@@ -217,19 +231,111 @@ fn lockscreen_action(app: tauri::AppHandle, action: String) -> Result<(), String
     Ok(())
 }
 
+#[tauri::command]
+fn request_quit(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.allow_exit.store(true, Ordering::SeqCst);
+    let _ = app.exit(0);
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .setup(|_app| Ok(()))
+        .setup(|app| {
+            let tray_menu = MenuBuilder::new(app)
+                .text("tray_show", "显示主界面")
+                .text("tray_hide", "隐藏到托盘")
+                .separator()
+                .text("tray_quit", "退出")
+                .build()?;
+
+            let tray = TrayIconBuilder::new()
+                .icon(TRAY_ICON.clone())
+                .tooltip("护眼吧")
+                .menu(&tray_menu)
+                .show_menu_on_left_click(false)
+                .on_tray_icon_event(|tray, event| {
+                    let app = tray.app_handle();
+                    let Some(window) = app.get_webview_window("main") else {
+                        return;
+                    };
+                    match event {
+                        TrayIconEvent::Click {
+                            button,
+                            button_state,
+                            ..
+                        } => {
+                            if button == MouseButton::Left
+                                && button_state == MouseButtonState::Up
+                            {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+                        }
+                        TrayIconEvent::DoubleClick { button, .. } => {
+                            if button == MouseButton::Left {
+                                let visible = window.is_visible().unwrap_or(true);
+                                if visible {
+                                    let _ = window.hide();
+                                } else {
+                                    let _ = window.show();
+                                    let _ = window.set_focus();
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                })
+                .on_menu_event(|app, event| {
+                    let Some(window) = app.get_webview_window("main") else {
+                        return;
+                    };
+                    match event.id().as_ref() {
+                        "tray_show" => {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                        "tray_hide" => {
+                            let _ = window.hide();
+                        }
+                        "tray_quit" => {
+                            if let Some(state) = app.try_state::<AppState>() {
+                                state.allow_exit.store(true, Ordering::SeqCst);
+                            }
+                            app.exit(0);
+                        }
+                        _ => {}
+                    }
+                })
+                .build(app)?;
+
+            app.manage(tray);
+            Ok(())
+        })
         .on_window_event(|window, event| {
-            if matches!(event, WindowEvent::CloseRequested { .. } | WindowEvent::Destroyed) {
-                if window.label() == "main" {
+            if window.label() != "main" {
+                return;
+            }
+            match event {
+                WindowEvent::CloseRequested { api, .. } => {
+                    if let Some(state) = window.app_handle().try_state::<AppState>() {
+                        if !state.allow_exit.load(Ordering::SeqCst) {
+                            let _ = window.hide();
+                            api.prevent_close();
+                            return;
+                        }
+                    }
                     let _ = apply_gamma(1.0, 1.0, 1.0);
                 }
+                WindowEvent::Destroyed => {
+                    let _ = apply_gamma(1.0, 1.0, 1.0);
+                }
+                _ => {}
             }
         })
         .manage(LockState::default())
+        .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             greet,
             set_gamma,
@@ -238,7 +344,8 @@ pub fn run() {
             hide_lock_windows,
             broadcast_lock_update,
             get_lock_update,
-            lockscreen_action
+            lockscreen_action,
+            request_quit
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
