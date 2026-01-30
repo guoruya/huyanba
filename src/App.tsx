@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import "./App.css";
 
 function pad2(value: number) {
@@ -43,10 +43,6 @@ function App() {
   const [allowEscExit, setAllowEscExit] = useState(true);
   const [showLockScreen, setShowLockScreen] = useState(false);
   const [activePreset, setActivePreset] = useState("智能");
-  const [locationName, setLocationName] = useState("北京");
-  const [weatherLabel] = useState("待实现");
-  const [tempRange] = useState("--°C");
-  const [weatherHint] = useState("天气功能将在最后实现");
   const [nextRestAt, setNextRestAt] = useState<Date | null>(null);
   const [restEndAt, setRestEndAt] = useState<Date | null>(null);
   const [restPaused, setRestPaused] = useState(false);
@@ -59,12 +55,17 @@ function App() {
     restCountdown: "00:00:00",
     restPaused: false,
     allowEscExit: true,
-    weatherLabel: "待实现",
-    tempRange: "--°C",
   });
   const [lockEndAtMs, setLockEndAtMs] = useState<number | null>(null);
   const [lockPausedLocal, setLockPausedLocal] = useState(false);
   const [lockRemainingLocal, setLockRemainingLocal] = useState(0);
+  const [lockBackgroundUrl, setLockBackgroundUrl] = useState<string | null>(
+    null,
+  );
+  const [lockWallpaperHistory, setLockWallpaperHistory] = useState<string[]>(
+    [],
+  );
+  const [lockWallpaperIndex, setLockWallpaperIndex] = useState(0);
 
   const presets = useMemo(
     () => ({
@@ -217,6 +218,24 @@ function App() {
 
   useEffect(() => {
     if (isLockWindow) return;
+    invoke("prefetch_lock_wallpaper").catch((error) =>
+      console.error("预取锁屏壁纸失败", error),
+    );
+  }, [isLockWindow]);
+
+  useEffect(() => {
+    if (isLockWindow) return;
+    const oneDay = 24 * 60 * 60 * 1000;
+    const timer = window.setInterval(() => {
+      invoke("prefetch_lock_wallpaper").catch((error) =>
+        console.error("预取锁屏壁纸失败", error),
+      );
+    }, oneDay);
+    return () => window.clearInterval(timer);
+  }, [isLockWindow]);
+
+  useEffect(() => {
+    if (isLockWindow) return;
     if (showLockScreen) {
       const endAt = restEndAt ?? new Date(Date.now() + restDuration * 60 * 1000);
       invoke("show_lock_windows", {
@@ -279,6 +298,61 @@ function App() {
       allowEscExit: allowEsc,
     }));
   }, [isLockWindow]);
+
+  useEffect(() => {
+    if (!isLockWindow) return;
+    let active = true;
+    invoke<string | null>("get_lock_wallpaper")
+      .then((path) => {
+        if (!active) return;
+        if (path) {
+          const url = convertFileSrc(path);
+          setLockBackgroundUrl(url);
+          setLockWallpaperHistory([url]);
+          setLockWallpaperIndex(0);
+        } else {
+          setLockBackgroundUrl(null);
+          setLockWallpaperHistory([]);
+          setLockWallpaperIndex(0);
+        }
+      })
+      .catch((error) => {
+        console.error("获取锁屏壁纸失败", error);
+        setLockBackgroundUrl(null);
+        setLockWallpaperHistory([]);
+        setLockWallpaperIndex(0);
+      });
+    return () => {
+      active = false;
+    };
+  }, [isLockWindow]);
+
+  const handleNextWallpaper = useCallback(() => {
+    if (!isLockWindow) return;
+    if (lockWallpaperIndex < lockWallpaperHistory.length - 1) {
+      const nextIndex = lockWallpaperIndex + 1;
+      setLockWallpaperIndex(nextIndex);
+      setLockBackgroundUrl(lockWallpaperHistory[nextIndex]);
+      return;
+    }
+    invoke<string | null>("get_lock_wallpaper")
+      .then((path) => {
+        if (!path) return;
+        const url = convertFileSrc(path);
+        setLockWallpaperHistory((prev) => [...prev, url]);
+        setLockWallpaperIndex((prev) => prev + 1);
+        setLockBackgroundUrl(url);
+      })
+      .catch((error) => console.error("切换壁纸失败", error));
+  }, [isLockWindow, lockWallpaperHistory, lockWallpaperIndex]);
+
+  const handlePrevWallpaper = useCallback(() => {
+    if (!isLockWindow) return;
+    if (lockWallpaperIndex <= 0) return;
+    const nextIndex = lockWallpaperIndex - 1;
+    setLockWallpaperIndex(nextIndex);
+    setLockBackgroundUrl(lockWallpaperHistory[nextIndex]);
+  }, [isLockWindow, lockWallpaperHistory, lockWallpaperIndex]);
 
   useEffect(() => {
     if (!isLockWindow) return;
@@ -418,8 +492,6 @@ function App() {
       restCountdown,
       restPaused,
       allowEscExit,
-      weatherLabel,
-      tempRange,
     }).catch((error) => console.error("锁屏数据同步失败", error));
   }, [
     isLockWindow,
@@ -429,8 +501,6 @@ function App() {
     restCountdown,
     restPaused,
     allowEscExit,
-    weatherLabel,
-    tempRange,
   ]);
 
 
@@ -444,8 +514,6 @@ function App() {
         restCountdown,
         restPaused,
         allowEscExit,
-        weatherLabel,
-        tempRange,
       }).catch((error) => console.error("锁屏数据同步失败", error));
     }, 1000);
     return () => clearInterval(timer);
@@ -457,8 +525,6 @@ function App() {
     restCountdown,
     restPaused,
     allowEscExit,
-    weatherLabel,
-    tempRange,
   ]);
 
   return (
@@ -478,12 +544,6 @@ function App() {
               </div>
             </div>
             <div className="topbar__right">
-              <div className="weather-pill">
-                <span className="weather-pill__icon">☁</span>
-                <span>
-                  {locationName} · {weatherLabel} · {tempRange}
-                </span>
-              </div>
               <div className="time-pill">
                 <span>{timeText}</span>
                 <span className="time-pill__date">{dateText}</span>
@@ -673,31 +733,12 @@ function App() {
             </label>
 
             <label className="setting-row">
-              <span>启动最小化到托盘</span>
-              <label className="toggle">
-                <input type="checkbox" defaultChecked />
-                <span className="toggle__track" />
-              </label>
-            </label>
-
-            <label className="setting-row">
               <span>开机自启</span>
               <label className="toggle">
                 <input type="checkbox" />
                 <span className="toggle__track" />
               </label>
             </label>
-
-            <label className="setting-row">
-              <span>天气城市</span>
-              <input
-                className="text-input"
-                value={locationName}
-                onChange={(event) => setLocationName(event.target.value)}
-              />
-            </label>
-            {weatherHint ? <p className="helper-text">{weatherHint}</p> : null}
-
           </div>
         </div>
           </section>
@@ -739,18 +780,40 @@ function App() {
       )}
 
       {isLockWindow && (
-        <div className="lockscreen">
+        <div
+          className="lockscreen"
+          style={
+            lockBackgroundUrl
+              ? { ["--lockscreen-bg" as string]: `url(${lockBackgroundUrl})` }
+              : undefined
+          }
+        >
           <div className="lockscreen__scrim" />
+          <div className="lockscreen__nav">
+            <button
+              className="lockscreen__nav-btn"
+              type="button"
+              onClick={handlePrevWallpaper}
+              aria-label="上一张壁纸"
+            >
+              {"<"}
+            </button>
+            <button
+              className="lockscreen__nav-btn"
+              type="button"
+              onClick={handleNextWallpaper}
+              aria-label="下一张壁纸"
+            >
+              {">"}
+            </button>
+          </div>
           <div className="lockscreen__content">
             <div className="lockscreen__top">
               <div>
                 <p className="lockscreen__time">{lockPayload.timeText}</p>
                 <p className="lockscreen__date">{lockPayload.dateText}</p>
               </div>
-              <div className="lockscreen__weather">
-                <span>{lockPayload.weatherLabel}</span>
-                <span>{lockPayload.tempRange}</span>
-              </div>
+              <div />
             </div>
             <div className="lockscreen__center">
               <p>休息一下，放松眼睛</p>
@@ -774,27 +837,6 @@ function App() {
               </p>
             </div>
             <div className="lockscreen__actions">
-              <div className="lockscreen__buttons">
-                <button
-                  className="btn btn--light"
-                  type="button"
-                  onClick={() =>
-                    invoke("lockscreen_action", { action: "exit" })
-                  }
-                >
-                  立即返回
-                </button>
-                <button
-                  className="btn btn--ghost"
-                  type="button"
-                  onClick={() => {
-                    handleTogglePauseLocal();
-                    invoke("lockscreen_action", { action: "toggle_pause" });
-                  }}
-                >
-                  {lockPayload.restPaused ? "继续计时" : "暂停计时"}
-                </button>
-              </div>
               {lockPayload.allowEscExit ? (
                 <span className="helper-text">ESC 退出已开启</span>
               ) : (

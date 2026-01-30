@@ -539,6 +539,7 @@ input[type="range"] {
 }
 
 .lockscreen {
+  --lockscreen-bg: none;
   position: fixed;
   inset: 0;
   z-index: 10;
@@ -546,14 +547,59 @@ input[type="range"] {
   place-items: center;
   color: #f7f7f1;
   animation: fadeIn 0.5s ease both;
+  background-color: #0a1416;
 }
 
 .lockscreen__scrim {
   position: absolute;
   inset: 0;
-  background: radial-gradient(circle at top, rgba(23, 44, 48, 0.35), rgba(12, 23, 26, 0.9)),
-    linear-gradient(135deg, rgba(20, 42, 40, 0.8), rgba(6, 20, 22, 0.95));
+  background-image: var(--lockscreen-bg),
+    radial-gradient(circle at top, rgba(23, 44, 48, 0.28), rgba(12, 23, 26, 0.7)),
+    linear-gradient(135deg, rgba(20, 42, 40, 0.55), rgba(6, 20, 22, 0.8));
   background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+  background-blend-mode: normal, multiply, multiply;
+}
+
+.lockscreen__nav {
+  position: absolute;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 32px;
+  z-index: 2;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity 0.2s ease, visibility 0.2s ease;
+}
+
+.lockscreen:hover .lockscreen__nav {
+  display: flex;
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+}
+
+.lockscreen__nav-btn {
+  width: 48px;
+  height: 48px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  background: rgba(8, 16, 18, 0.55);
+  color: #f7f7f1;
+  font-size: 20px;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  transition: transform 0.2s ease, background 0.2s ease;
+}
+
+.lockscreen__nav-btn:hover {
+  transform: scale(1.05);
+  background: rgba(8, 16, 18, 0.75);
 }
 
 .lockscreen__content {
@@ -562,11 +608,11 @@ input[type="range"] {
   width: min(880px, 86vw);
   padding: 48px;
   border-radius: 32px;
-  background: rgba(8, 16, 18, 0.6);
-  backdrop-filter: blur(12px);
+  background: transparent;
+  backdrop-filter: none;
   display: grid;
   gap: 36px;
-  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.4);
+  box-shadow: none;
 }
 
 .lockscreen__top {
@@ -643,7 +689,7 @@ input[type="range"] {
 
 .lockscreen__actions {
   display: flex;
-  justify-content: space-between;
+  justify-content: center;
   align-items: center;
   gap: 12px;
 }

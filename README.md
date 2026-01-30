@@ -18,6 +18,9 @@
 锁屏（全屏覆盖 + 倒计时）
 ![锁屏](docs/images/锁屏.png)
 
+故宫壁纸功能（在线获取 + 缓存轮播）
+![故宫壁纸功能](docs/images/故宫壁纸功能.png)
+
 ## 安装包位置（本机）
 ```
 D:\Ai\huyanba\huzamba\src-tauri\target\release\bundle\nsis\huyanba_0.1.0_x64-setup.exe
@@ -66,6 +69,9 @@ Filter & Schedule
 
 Lockscreen
 ![Lockscreen](docs/images/锁屏.png)
+
+Palace Museum wallpapers (online fetch + cached rotation)
+![Palace Museum Wallpapers](docs/images/故宫壁纸功能.png)
 
 ## Installer (local path)
 ```
