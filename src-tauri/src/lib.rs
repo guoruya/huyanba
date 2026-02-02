@@ -23,6 +23,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Gdi::{GetDC, ReleaseDC};
 use windows::Win32::UI::ColorSystem::SetDeviceGammaRamp;
+use std::time::Instant;
 
 #[derive(Default)]
 struct LockState {
@@ -171,6 +172,7 @@ async fn show_lock_windows(
     paused_remaining: i64,
     allow_esc: bool,
 ) -> Result<(), String> {
+    let start = Instant::now();
     let mut labels = state.labels.lock().map_err(|_| "锁状态被占用")?;
     if !labels.is_empty() {
         for label in labels.iter() {
@@ -186,6 +188,7 @@ async fn show_lock_windows(
     let monitors = app
         .available_monitors()
         .map_err(|err| err.to_string())?;
+    append_app_log(&app, &format!("锁屏创建开始 monitors={}", monitors.len()));
     for (index, monitor) in monitors.into_iter().enumerate() {
         let label = format!("lockscreen-{}", index);
         let position = monitor.position();
@@ -219,6 +222,10 @@ async fn show_lock_windows(
         labels.push(label);
     }
 
+    append_app_log(
+        &app,
+        &format!("锁屏创建完成 labels={} elapsed_ms={}", labels.len(), start.elapsed().as_millis()),
+    );
     Ok(())
 }
 
@@ -227,13 +234,16 @@ fn hide_lock_windows(
     app: tauri::AppHandle,
     state: tauri::State<'_, LockState>,
 ) -> Result<(), String> {
+    let start = Instant::now();
     let mut labels = state.labels.lock().map_err(|_| "锁状态被占用")?;
+    append_app_log(&app, &format!("锁屏关闭开始 labels={}", labels.len()));
     for label in labels.iter() {
         if let Some(window) = app.get_webview_window(label) {
             let _ = window.close();
         }
     }
     labels.clear();
+    append_app_log(&app, &format!("锁屏关闭完成 elapsed_ms={}", start.elapsed().as_millis()));
     Ok(())
 }
 
@@ -261,6 +271,7 @@ fn get_lock_update(state: tauri::State<'_, LockState>) -> Option<LockUpdate> {
 
 #[tauri::command]
 fn lockscreen_action(app: tauri::AppHandle, action: String) -> Result<(), String> {
+    append_app_log(&app, &format!("锁屏动作: {}", action));
     for (_label, window) in app.webview_windows() {
         let _ = window.emit("lockscreen-action", action.clone());
     }
@@ -301,6 +312,23 @@ fn ensure_wallpaper_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+fn append_app_log(app: &AppHandle, message: &str) {
+    let dir = match ensure_wallpaper_dir(app) {
+        Ok(dir) => dir,
+        Err(_) => return,
+    };
+    let path = dir.join("app.log");
+    let ts = now_ts();
+    let line = format!("[{}] {}\n", ts, message);
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
 fn append_wallpaper_log(app: &AppHandle, message: &str) {
     let Ok(dir) = ensure_wallpaper_dir(app) else {
         return;
@@ -315,6 +343,12 @@ fn append_wallpaper_log(app: &AppHandle, message: &str) {
     {
         let _ = file.write_all(line.as_bytes());
     }
+}
+
+#[tauri::command]
+fn log_app(app: AppHandle, message: String) -> Result<(), String> {
+    append_app_log(&app, &message);
+    Ok(())
 }
 
 fn prune_missing_files(state: &mut WallpaperState) {
@@ -808,7 +842,8 @@ pub fn run() {
             lockscreen_action,
             get_lock_wallpaper,
             prefetch_lock_wallpaper,
-            request_quit
+            request_quit,
+            log_app
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

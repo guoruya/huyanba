@@ -23,7 +23,7 @@
 
 ## 安装包位置（本机）
 ```
-D:\Ai\huyanba\huzamba\src-tauri\target\release\bundle\nsis\huyanba_0.1.0_x64-setup.exe
+D:\Ai\huyanba\huzamba\src-tauri\target\release\bundle\nsis\huyanba_0.4.0_x64-setup.exe
 ```
 
 ## 本地开发
@@ -75,7 +75,7 @@ Palace Museum wallpapers (online fetch + cached rotation)
 
 ## Installer (local path)
 ```
-D:\Ai\huyanba\huzamba\src-tauri\target\release\bundle\nsis\huyanba_0.1.0_x64-setup.exe
+D:\Ai\huyanba\huzamba\src-tauri\target\release\bundle\nsis\huyanba_0.4.0_x64-setup.exe
 ```
 
 ## Development

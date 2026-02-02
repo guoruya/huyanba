@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import "./App.css";
@@ -66,6 +66,9 @@ function App() {
     [],
   );
   const [lockWallpaperIndex, setLockWallpaperIndex] = useState(0);
+  const exitInProgressRef = useRef(false);
+  const exitRestRef = useRef<() => void>(() => {});
+  const togglePauseRef = useRef<() => void>(() => {});
 
   const presets = useMemo(
     () => ({
@@ -112,6 +115,7 @@ function App() {
   }, [activePreset, resolvePreset]);
 
   const handleStartRest = useCallback(() => {
+    exitInProgressRef.current = false;
     const endAt = new Date(Date.now() + restDuration * 60 * 1000);
     setRestPaused(false);
     setRestPausedRemaining(null);
@@ -120,6 +124,9 @@ function App() {
   }, [restDuration]);
 
   const handleExitRest = useCallback(() => {
+    if (exitInProgressRef.current) return;
+    exitInProgressRef.current = true;
+    invoke("log_app", { message: "前端退出休息: start" }).catch(() => undefined);
     setShowLockScreen(false);
     setRestPaused(false);
     setRestPausedRemaining(null);
@@ -136,6 +143,7 @@ function App() {
         colorTemp,
       }).catch(() => undefined);
     }
+    invoke("log_app", { message: "前端退出休息: end" }).catch(() => undefined);
   }, [
     restEnabled,
     restMinutes,
@@ -164,25 +172,24 @@ function App() {
     setRestPaused(true);
   }, [restEndAt, restPaused, restPausedRemaining, showLockScreen]);
 
-  const handleTogglePauseLocal = useCallback(() => {
-    if (!isLockWindow) return;
-    if (lockPausedLocal) {
-      const nextEnd = Date.now() + lockRemainingLocal * 1000;
-      setLockEndAtMs(nextEnd);
-      setLockPausedLocal(false);
-    } else {
-      const remaining = lockEndAtMs
-        ? Math.max(0, Math.floor((lockEndAtMs - Date.now()) / 1000))
-        : 0;
-      setLockRemainingLocal(remaining);
-      setLockPausedLocal(true);
-    }
-  }, [isLockWindow, lockPausedLocal, lockRemainingLocal, lockEndAtMs]);
+  useEffect(() => {
+    exitRestRef.current = handleExitRest;
+  }, [handleExitRest]);
+
+  useEffect(() => {
+    togglePauseRef.current = handleTogglePause;
+  }, [handleTogglePause]);
 
   useEffect(() => {
     const timer = setInterval(() => setNow(new Date()), 1000);
     return () => clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    if (showLockScreen) {
+      exitInProgressRef.current = false;
+    }
+  }, [showLockScreen]);
 
   useEffect(() => {
     if (isLockWindow) return;
@@ -245,6 +252,7 @@ function App() {
         allowEsc: allowEscExit,
       }).catch((error) => console.error("锁屏窗口创建失败", error));
     } else {
+      invoke("log_app", { message: "前端请求关闭锁屏" }).catch(() => undefined);
       invoke("hide_lock_windows").catch((error) =>
         console.error("锁屏窗口关闭失败", error),
       );
@@ -266,9 +274,9 @@ function App() {
     window
       .listen<string>("lockscreen-action", (event) => {
         if (event.payload === "exit") {
-          handleExitRest();
+          exitRestRef.current();
         } else if (event.payload === "toggle_pause") {
-          handleTogglePause();
+          togglePauseRef.current();
         }
       })
       .then((fn) => {
@@ -281,7 +289,7 @@ function App() {
         unlisten();
       }
     };
-  }, [isLockWindow, handleExitRest, handleTogglePause]);
+  }, [isLockWindow]);
 
   useEffect(() => {
     if (!isLockWindow) return;
