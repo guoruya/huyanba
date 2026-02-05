@@ -26,6 +26,10 @@
 D:\Ai\huyanba\huzamba\src-tauri\target\release\bundle\nsis\huyanba_0.4.0_x64-setup.exe
 ```
 
+## 安装包下载
+- 直接下载（Windows x64）：https://github.com/guoruya/huyanba/releases/download/v0.4.0/huyanba_0.4.0_x64-setup.exe
+- Release 页面：https://github.com/guoruya/huyanba/releases/tag/v0.4.0
+
 ## 本地开发
 ```
 cd D:\Ai\huyanba\huzamba
@@ -77,6 +81,10 @@ Palace Museum wallpapers (online fetch + cached rotation)
 ```
 D:\Ai\huyanba\huzamba\src-tauri\target\release\bundle\nsis\huyanba_0.4.0_x64-setup.exe
 ```
+
+## Download
+- Direct download (Windows x64): https://github.com/guoruya/huyanba/releases/download/v0.4.0/huyanba_0.4.0_x64-setup.exe
+- Release page: https://github.com/guoruya/huyanba/releases/tag/v0.4.0
 
 ## Development
 ```
