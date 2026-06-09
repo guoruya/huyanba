@@ -88,7 +88,8 @@ type PalaceStagingRefreshState =
   | "idle"
   | "running"
   | "succeeded"
-  | "failed";
+  | "failed"
+  | "cancelled";
 
 type PalaceStagingRefreshStatus = {
   state: PalaceStagingRefreshState;
@@ -161,13 +162,14 @@ type WallpaperStorageUpdateResult = {
   restoredDefault: boolean;
 };
 
-type UnsplashConfigSource = "appConfig" | "envLocal" | "env" | "none";
+type UnsplashConfigSource = "appConfig" | "envLocal" | "env" | "builtIn" | "none";
 
 type UnsplashSettings = {
   effectiveConfigured: boolean;
   configSource: UnsplashConfigSource;
   hasStoredKey: boolean;
   maskedStoredKey?: string | null;
+  isBuiltIn: boolean;
 };
 
 const WALLPAPER_PAGE_SIZE = 12;
@@ -254,6 +256,7 @@ function describeUnsplashConfigSource(source: UnsplashConfigSource) {
   if (source === "appConfig") return "应用内配置";
   if (source === "envLocal") return ".env.local";
   if (source === "env") return "环境变量";
+  if (source === "builtIn") return "内置 Key";
   return "未配置";
 }
 
@@ -659,6 +662,15 @@ function App() {
         palaceRefreshIntentRef.current = null;
       }
 
+      if (status.state === "cancelled") {
+        setPalaceStagingError(null);
+        setWallpaperActionTone("muted");
+        setWallpaperActionMessage(
+          status.message || "故宫候选壁纸获取已取消。",
+        );
+        palaceRefreshIntentRef.current = null;
+      }
+
       return status;
     },
     [applyPalaceStagingResult, palaceStagingWallpapers.length],
@@ -835,6 +847,17 @@ function App() {
     unsplashSearchResult,
     wallpaperRefreshPending,
   ]);
+
+  const handleCancelPalaceRefresh = useCallback(async () => {
+    if (isLockWindow) return;
+    try {
+      await invoke<PalaceStagingRefreshStatus>(
+        "cancel_palace_staging_refresh",
+      );
+    } catch (error) {
+      console.error("取消故宫候选壁纸获取失败", error);
+    }
+  }, [isLockWindow]);
 
   const handleUnsplashSearchSubmit = useCallback(
     async (event?: FormEvent<HTMLFormElement>) => {
@@ -1478,37 +1501,15 @@ function App() {
         if (!unsplashSearchResult && !unsplashSearchLoading && !unsplashSearchError) {
           await runUnsplashSearch(unsplashSearchInput, 1);
         }
-      } else if (activeRemoteSource === "unsplash") {
-        setActiveRemoteSource("palace");
       }
-
-      if (
-        (activeRemoteSource === "palace" || !effectiveConfigured) &&
-        !palaceStagingBootstrapped &&
-        !palaceStagingLoading
-      ) {
-        setPalaceStagingBootstrapped(true);
-        const [result, status] = await Promise.all([
-          loadPalaceStagingWallpapers(),
-          loadPalaceRefreshStatus(),
-        ]);
-        if (result.items.length === 0 && status.state !== "running") {
-          await refreshPalaceStagingBatch("auto", 1);
-        }
-      }
+      // 故宫壁纸不再自动触发获取，必须用户手动点击按钮
     })();
   }, [
     activeView,
-    activeRemoteSource,
     isLockWindow,
     loadLocalWallpapers,
     loadUnsplashSettings,
-    loadPalaceRefreshStatus,
-    loadPalaceStagingWallpapers,
     loadWallpaperStorageSettings,
-    palaceStagingBootstrapped,
-    palaceStagingLoading,
-    refreshPalaceStagingBatch,
     runUnsplashSearch,
     unsplashSearchError,
     unsplashSearchInput,
@@ -2138,6 +2139,15 @@ function App() {
                   >
                     {isPalaceRefreshRunning ? "获取中..." : "刷新当前页"}
                   </button>
+                  {isPalaceRefreshRunning && (
+                    <button
+                      className="btn btn--ghost"
+                      type="button"
+                      onClick={() => void handleCancelPalaceRefresh()}
+                    >
+                      取消
+                    </button>
+                  )}
                 </>
               )
             ) : (
@@ -2222,16 +2232,34 @@ function App() {
             <div className="wallpaper-storage-panel__meta">
               <div>
                 <p className="card__eyebrow">Unsplash Access Key</p>
-                <strong>{isUnsplashConfigured ? "已配置" : "未配置"}</strong>
+                <strong>
+                {unsplashSettings?.isBuiltIn
+                  ? "内置 Key 已激活"
+                  : isUnsplashConfigured
+                    ? "已配置"
+                    : "未配置"}
+              </strong>
               </div>
               <span className="helper-text">当前来源：{unsplashConfigSourceLabel}</span>
             </div>
             <div className="wallpaper-storage-panel__meta wallpaper-storage-panel__meta--stack">
-              <p className="helper-text">
-                {unsplashSettings?.hasStoredKey
-                  ? `已保存内置 Key：${unsplashSettings.maskedStoredKey || "已保存"}`
-                  : "当前没有保存应用内 Key。"}
-              </p>
+              {unsplashSettings?.isBuiltIn ? (
+                <p className="helper-text helper-text--success">
+                  正在使用程序内置的 Unsplash Access Key，无需额外配置。
+                </p>
+              ) : null}
+              {unsplashSettings?.hasStoredKey ? (
+                <p className="helper-text">
+                  已保存应用内 Key：{unsplashSettings.maskedStoredKey || "已保存"}
+                </p>
+              ) : unsplashSettings?.isBuiltIn ? (
+                <p className="helper-text">
+                  内置 Key（{unsplashSettings.maskedStoredKey || "已配置"}）。
+                  你可以保存自己的 Key 来覆盖内置 Key。
+                </p>
+              ) : (
+                <p className="helper-text">当前没有保存应用内 Key。</p>
+              )}
               <p className="helper-text">
                 这里只需要 Access Key，不需要 Application ID 和 Secret Key。
               </p>
@@ -2266,7 +2294,9 @@ function App() {
                   !unsplashSettings?.hasStoredKey
                 }
               >
-                清除内置 Key
+                {unsplashSettings?.hasStoredKey
+                  ? "清除已保存 Key"
+                  : "清除内置 Key"}
               </button>
             </div>
             <div className="wallpaper-storage-panel__meta wallpaper-storage-panel__meta--stack">

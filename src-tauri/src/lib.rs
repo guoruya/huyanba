@@ -12,11 +12,13 @@ use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{Cursor, Write};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Mutex,
+    atomic::{AtomicBool, AtomicU32, Ordering},
+    Mutex, OnceLock,
 };
 use std::time::Instant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -44,6 +46,7 @@ enum PalaceStagingRefreshState {
     Running,
     Succeeded,
     Failed,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -79,6 +82,8 @@ struct AppState {
     allow_exit: AtomicBool,
     wallpaper_lock: Mutex<()>,
     palace_refresh_status: Mutex<PalaceStagingRefreshStatus>,
+    cancel_refresh: AtomicBool,
+    batch_in_progress: AtomicBool,
 }
 
 const TRAY_ICON: tauri::image::Image<'static> = tauri::include_image!("icons/32x32.png");
@@ -90,6 +95,9 @@ const WALLPAPER_LIST_PAGE_SAMPLE: usize = 6;
 const WALLPAPER_SEARCH_PAGE_SIZE: usize = 12;
 const WALLPAPER_MIN_INTERVAL_SECS: i64 = 1;
 const WALLPAPER_MIN_WIDTH: u32 = 1920;
+const PALACE_BATCH_TOTAL_TIMEOUT_SECS: u64 = 120;
+const MAX_FALLBACK_CHAIN_DEPTH: u32 = 3;
+const DEFAULT_UNSPLASH_ACCESS_KEY: &str = "6cg78olt-4hzm2S2MThHOqrOx8H0Ut-GYhqJ3gcnt54";
 const PALACE_LIST_PAGE_SIZE: usize = 24;
 const PALACE_STAGING_DIR_NAME: &str = "palace-staging";
 const PALACE_STAGING_TEMP_DIR_NAME: &str = "palace-staging-next";
@@ -106,6 +114,20 @@ const PALACE_ACCEPT_HEADER: &str =
 const PALACE_ACCEPT_LANGUAGE_HEADER: &str = "zh-CN,zh;q=0.9,en;q=0.8";
 const PALACE_USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36";
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW_FLAG: u32 = 0x08000000;
+
+#[cfg(target_os = "windows")]
+fn palace_silent_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    command.creation_flags(CREATE_NO_WINDOW_FLAG);
+    command
+}
+
+#[cfg(not(target_os = "windows"))]
+fn palace_silent_command(program: &str) -> Command {
+    Command::new(program)
+}
 
 fn default_source_kind() -> String {
     "legacy".into()
@@ -203,6 +225,7 @@ enum UnsplashConfigSource {
     AppConfig,
     EnvLocal,
     Env,
+    BuiltIn,
     None,
 }
 
@@ -213,6 +236,7 @@ struct UnsplashSettings {
     config_source: UnsplashConfigSource,
     has_stored_key: bool,
     masked_stored_key: Option<String>,
+    is_built_in: bool,
 }
 
 #[derive(Clone)]
@@ -221,6 +245,7 @@ struct ResolvedUnsplashAccessKey {
     source: UnsplashConfigSource,
     has_stored_key: bool,
     masked_stored_key: Option<String>,
+    is_built_in: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -859,6 +884,7 @@ fn resolve_unsplash_access_key(app: &AppHandle) -> ResolvedUnsplashAccessKey {
             source: UnsplashConfigSource::AppConfig,
             has_stored_key,
             masked_stored_key,
+            is_built_in: false,
         };
     }
 
@@ -868,6 +894,7 @@ fn resolve_unsplash_access_key(app: &AppHandle) -> ResolvedUnsplashAccessKey {
             source: UnsplashConfigSource::EnvLocal,
             has_stored_key,
             masked_stored_key,
+            is_built_in: false,
         };
     }
 
@@ -879,8 +906,21 @@ fn resolve_unsplash_access_key(app: &AppHandle) -> ResolvedUnsplashAccessKey {
                 source: UnsplashConfigSource::Env,
                 has_stored_key,
                 masked_stored_key,
+                is_built_in: false,
             };
         }
+    }
+
+    // 内置 key 作为最终回退，保证每个副本都可用
+    let built_in_key = DEFAULT_UNSPLASH_ACCESS_KEY.trim();
+    if !built_in_key.is_empty() {
+        return ResolvedUnsplashAccessKey {
+            access_key: Some(built_in_key.to_string()),
+            source: UnsplashConfigSource::BuiltIn,
+            has_stored_key,
+            masked_stored_key: mask_access_key(built_in_key),
+            is_built_in: true,
+        };
     }
 
     ResolvedUnsplashAccessKey {
@@ -888,6 +928,7 @@ fn resolve_unsplash_access_key(app: &AppHandle) -> ResolvedUnsplashAccessKey {
         source: UnsplashConfigSource::None,
         has_stored_key,
         masked_stored_key,
+        is_built_in: false,
     }
 }
 
@@ -897,6 +938,7 @@ fn unsplash_settings_from_resolved(resolved: ResolvedUnsplashAccessKey) -> Unspl
         config_source: resolved.source,
         has_stored_key: resolved.has_stored_key,
         masked_stored_key: resolved.masked_stored_key,
+        is_built_in: resolved.is_built_in,
     }
 }
 
@@ -1905,7 +1947,7 @@ Invoke-WebRequest -Uri '{url}' -Headers $headers -OutFile '{output_path}' -UseBa
         url = escape_powershell_single_quoted(url),
         output_path = escape_powershell_single_quoted(&output_path.to_string_lossy()),
     );
-    let output = Command::new("powershell")
+    let output = palace_silent_command("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .output()
         .map_err(|err| err.to_string())?;
@@ -1924,7 +1966,7 @@ fn run_powershell_download(_url: &str, _output_path: &Path) -> Result<(), String
 
 #[cfg(target_os = "windows")]
 fn run_curl_download(url: &str, output_path: &Path) -> Result<(), String> {
-    let output = Command::new("curl.exe")
+    let output = palace_silent_command("curl.exe")
         .args([
             "-L",
             "-sS",
@@ -1959,6 +2001,38 @@ fn run_curl_download(url: &str, output_path: &Path) -> Result<(), String> {
 #[cfg(not(target_os = "windows"))]
 fn run_curl_download(_url: &str, _output_path: &Path) -> Result<(), String> {
     Err("当前平台不支持 curl 回退。".into())
+}
+
+fn powershell_available() -> bool {
+    static CACHED: OnceLock<Option<bool>> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", "exit 0"])
+            .creation_flags(CREATE_NO_WINDOW_FLAG)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .map(|o| o.status.success())
+            .ok()
+    })
+    .as_ref()
+    .unwrap_or(&false)
+}
+
+fn curl_available() -> bool {
+    static CACHED: OnceLock<Option<bool>> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::process::Command::new("curl.exe")
+            .arg("--version")
+            .creation_flags(CREATE_NO_WINDOW_FLAG)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .map(|o| o.status.success())
+            .ok()
+    })
+    .as_ref()
+    .unwrap_or(&false)
 }
 
 fn palace_fetch_text_via_powershell(url: &str) -> Result<String, String> {
@@ -2020,6 +2094,39 @@ fn palace_fetch_bytes_with_client(client: &Client, url: &str) -> Result<Vec<u8>,
         .map_err(|err| err.to_string())
 }
 
+static GLOBAL_FALLBACK_DEPTH: AtomicU32 = AtomicU32::new(0);
+
+fn fallback_depth_exceeded() -> bool {
+    GLOBAL_FALLBACK_DEPTH.load(Ordering::Relaxed) >= MAX_FALLBACK_CHAIN_DEPTH
+}
+
+fn enter_fallback() {
+    GLOBAL_FALLBACK_DEPTH.fetch_add(1, Ordering::SeqCst);
+}
+
+fn leave_fallback() {
+    GLOBAL_FALLBACK_DEPTH.fetch_sub(1, Ordering::SeqCst);
+}
+
+fn reset_fallback_depth() {
+    GLOBAL_FALLBACK_DEPTH.store(0, Ordering::SeqCst);
+}
+
+struct FallbackGuard;
+
+impl FallbackGuard {
+    fn new() -> Self {
+        enter_fallback();
+        FallbackGuard
+    }
+}
+
+impl Drop for FallbackGuard {
+    fn drop(&mut self) {
+        leave_fallback();
+    }
+}
+
 fn palace_fetch_with_fallback<T, F, G, H>(
     app: Option<&AppHandle>,
     context: &str,
@@ -2034,59 +2141,55 @@ where
     H: FnMut(&str) -> Result<T, String>,
 {
     let client = build_palace_client(false)?;
-    match reqwest_fetch(&client, url) {
+    let no_proxy_err = match reqwest_fetch(&client, url) {
         Ok(value) => {
             log_palace_transport(app, context, "reqwest_success", url, "ok");
-            Ok(value)
+            return Ok(value);
         }
         Err(first_err) => {
             if !should_retry_without_proxy(&first_err) {
                 return Err(first_err);
             }
-
             let fallback_client = build_palace_client(true)?;
             match reqwest_fetch(&fallback_client, url) {
                 Ok(value) => {
                     log_palace_transport(app, context, "reqwest_no_proxy_retry_success", url, "ok");
-                    Ok(value)
+                    return Ok(value);
                 }
-                Err(no_proxy_err) => match powershell_fetch(url) {
-                    Ok(value) => {
-                        log_palace_transport(
-                            app,
-                            context,
-                            "powershell_fallback_success",
-                            url,
-                            "ok",
-                        );
-                        Ok(value)
-                    }
-                    Err(powershell_err) => match curl_fetch(url) {
-                        Ok(value) => {
-                            log_palace_transport(app, context, "curl_fallback_success", url, "ok");
-                            Ok(value)
-                        }
-                        Err(curl_err) => {
-                            log_palace_transport(
-                                app,
-                                context,
-                                "all_transports_failed",
-                                url,
-                                &format!(
-                                    "reqwest={} ; no_proxy={} ; powershell={} ; curl={}",
-                                    first_err, no_proxy_err, powershell_err, curl_err
-                                ),
-                            );
-                            Err(format!(
-                                "故宫壁纸请求失败: reqwest={} ; no_proxy={} ; powershell={} ; curl={}",
-                                first_err, no_proxy_err, powershell_err, curl_err
-                            ))
-                        }
-                    },
-                },
+                Err(no_proxy_err) => no_proxy_err,
             }
         }
+    };
+
+    if fallback_depth_exceeded() {
+        return Err(format!(
+            "故宫壁纸请求失败（回退链已达上限，跳过 powershell/curl）: {}",
+            no_proxy_err
+        ));
     }
+
+    let _guard = FallbackGuard::new();
+
+    if powershell_available() {
+        if let Ok(value) = powershell_fetch(url) {
+            log_palace_transport(app, context, "powershell_fallback_success", url, "ok");
+            return Ok(value);
+        }
+    }
+
+    if curl_available() {
+        if let Ok(value) = curl_fetch(url) {
+            log_palace_transport(app, context, "curl_fallback_success", url, "ok");
+            return Ok(value);
+        }
+    }
+
+    Err(format!(
+        "故宫壁纸请求失败: reqwest+no_proxy={}（powershell={} curl={}）",
+        no_proxy_err,
+        if powershell_available() { "已尝试" } else { "不可用" },
+        if curl_available() { "已尝试" } else { "不可用" }
+    ))
 }
 
 fn palace_fetch_text(app: Option<&AppHandle>, context: &str, url: &str) -> Result<String, String> {
@@ -2726,6 +2829,8 @@ where
         ..PrefetchStats::default()
     };
 
+    let mut cancelled = false;
+
     let refresh_result = (|| {
         append_wallpaper_log(app, &format!("故宫候选批次拉取: page={}", page));
         let (entries, page_meta) =
@@ -2752,8 +2857,36 @@ where
         );
 
         stats.list_successes += 1;
+        let started = std::time::Instant::now();
         let total_entries = entries.len();
         for (processed_entries, entry) in entries.into_iter().enumerate() {
+            // 批次总超时检查
+            if started.elapsed().as_secs() >= PALACE_BATCH_TOTAL_TIMEOUT_SECS {
+                append_wallpaper_log(app, "故宫候选批次超时，终止剩余条目获取");
+                break;
+            }
+            // 用户取消检查
+            let app_state = app.state::<AppState>();
+            if app_state.cancel_refresh.load(Ordering::SeqCst) {
+                append_wallpaper_log(app, "故宫候选批次获取被用户取消");
+                let _ = set_palace_staging_refresh_status(
+                    app,
+                    PalaceStagingRefreshStatus {
+                        state: PalaceStagingRefreshState::Cancelled,
+                        target_page: page_meta.current_page,
+                        current_committed_page: next_state.current_page.max(1),
+                        processed_entries: processed_entries + 1,
+                        total_entries,
+                        message: "故宫候选壁纸获取已取消。".into(),
+                        error_message: None,
+                        batch: None,
+                    },
+                );
+                cancelled = true;
+                break;
+            }
+            drop(app_state);
+
             let processed_entries = processed_entries + 1;
             progress(
                 processed_entries,
@@ -2801,6 +2934,11 @@ where
         );
         Ok::<(), String>(())
     })();
+
+    if cancelled {
+        let _ = clear_dir_if_exists(&temp_dir);
+        return Err("已取消".into());
+    }
 
     if let Err(err) = refresh_result {
         let _ = clear_dir_if_exists(&temp_dir);
@@ -3282,10 +3420,36 @@ fn run_wallpaper_batch(
     reason: &str,
 ) -> Result<PrefetchStats, String> {
     let state = app.state::<AppState>();
+
+    // 防并发：同一时间只允许一个 batch 在运行
+    if state
+        .batch_in_progress
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        append_wallpaper_log(app, &format!("批量获取跳过（已有任务在运行）: {}", reason));
+        return Ok(PrefetchStats::default());
+    }
+
+    // 确保无论成功还是失败都释放 batch_in_progress
+    let result = run_wallpaper_batch_inner(app, force, target_count, reason);
+    state.batch_in_progress.store(false, Ordering::SeqCst);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_wallpaper_batch_inner(
+    app: &AppHandle,
+    force: bool,
+    target_count: usize,
+    reason: &str,
+) -> Result<PrefetchStats, String> {
+    let state = app.state::<AppState>();
     let _guard = state
         .wallpaper_lock
         .lock()
         .map_err(|_| "壁纸锁被占用".to_string())?;
+    reset_fallback_depth();
     let dir = ensure_wallpaper_dir(app)?;
     let state_path = dir.join("index.json");
     let mut wall_state = load_wallpaper_state(&state_path);
@@ -3675,6 +3839,17 @@ fn start_palace_staging_refresh(
         return Ok(existing_status);
     }
 
+    let state = app.state::<AppState>();
+    if state
+        .batch_in_progress
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("已有壁纸批量任务在运行，请稍后再试。".into());
+    }
+    // 重置取消标志，开始新一轮刷新
+    state.cancel_refresh.store(false, Ordering::SeqCst);
+
     let (root_dir, wall_state, current_batch) = prepare_palace_staging_refresh(&app)?;
     let target_page = page.unwrap_or(current_batch.page).max(1);
     let running_status = set_palace_staging_refresh_status(
@@ -3703,6 +3878,10 @@ fn start_palace_staging_refresh(
             }
         })
         .await;
+
+        // 任务完成后释放 batch_in_progress
+        let task_state = app_for_task.state::<AppState>();
+        task_state.batch_in_progress.store(false, Ordering::SeqCst);
 
         match background_result {
             Ok(Ok(batch)) => {
@@ -3758,6 +3937,28 @@ fn start_palace_staging_refresh(
     });
 
     Ok(running_status)
+}
+
+#[tauri::command]
+fn cancel_palace_staging_refresh(app: AppHandle) -> Result<PalaceStagingRefreshStatus, String> {
+    let state = app.state::<AppState>();
+    state.cancel_refresh.store(true, Ordering::SeqCst);
+    let mut status = PalaceStagingRefreshStatus {
+        state: PalaceStagingRefreshState::Cancelled,
+        target_page: 1,
+        current_committed_page: 1,
+        processed_entries: 0,
+        total_entries: 0,
+        message: "故宫候选壁纸获取已取消。".into(),
+        error_message: None,
+        batch: None,
+    };
+    let batch = load_palace_staging_batch_result_with_lock(&app).ok();
+    if let Some(b) = &batch {
+        status.current_committed_page = b.page.max(1);
+        status.target_page = b.page.max(1);
+    }
+    set_palace_staging_refresh_status(&app, status)
 }
 
 #[tauri::command]
@@ -4274,6 +4475,7 @@ pub fn run() {
             get_palace_staging_batch,
             get_palace_staging_refresh_status,
             start_palace_staging_refresh,
+            cancel_palace_staging_refresh,
             list_palace_staging_wallpapers,
             promote_palace_staging_wallpaper,
             promote_palace_staging_wallpapers,
