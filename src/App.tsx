@@ -270,7 +270,7 @@ function App() {
   const [colorTemp, setColorTemp] = useState(4700);
   const [restEnabled, setRestEnabled] = useState(true);
   const [restMinutes, setRestMinutes] = useState(30);
-  const [restDuration, setRestDuration] = useState(1);
+  const [restDuration, setRestDuration] = useState(60);
   const [allowEscExit, setAllowEscExit] = useState(true);
   const [showLockScreen, setShowLockScreen] = useState(false);
   const [activePreset, setActivePreset] = useState("智能");
@@ -432,7 +432,7 @@ function App() {
 
   const handleStartRest = useCallback(() => {
     exitInProgressRef.current = false;
-    const endAt = new Date(Date.now() + restDuration * 60 * 1000);
+    const endAt = new Date(Date.now() + restDuration * 1000);
     setRestPaused(false);
     setRestPausedRemaining(null);
     setRestEndAt(endAt);
@@ -1538,7 +1538,7 @@ function App() {
   useEffect(() => {
     if (isLockWindow) return;
     if (showLockScreen) {
-      const endAt = restEndAt ?? new Date(Date.now() + restDuration * 60 * 1000);
+      const endAt = restEndAt ?? new Date(Date.now() + restDuration * 1000);
       invoke("show_lock_windows", {
         endAtMs: endAt.getTime(),
         paused: restPaused,
@@ -1770,7 +1770,7 @@ function App() {
     if (!restEnabled || showLockScreen) return;
     if (!nextRestAt) return;
     if (now.getTime() >= nextRestAt.getTime()) {
-      const endAt = new Date(Date.now() + restDuration * 60 * 1000);
+      const endAt = new Date(Date.now() + restDuration * 1000);
       setRestPaused(false);
       setRestPausedRemaining(null);
       setRestEndAt(endAt);
@@ -1789,10 +1789,10 @@ function App() {
   useEffect(() => {
     if (!showLockScreen) return;
     if (restPaused) {
-      setRestPausedRemaining(restDuration * 60);
+      setRestPausedRemaining(restDuration);
       return;
     }
-    setRestEndAt(new Date(Date.now() + restDuration * 60 * 1000));
+    setRestEndAt(new Date(Date.now() + restDuration * 1000));
   }, [restDuration, showLockScreen, restPaused]);
 
   useEffect(() => {
@@ -1823,7 +1823,7 @@ function App() {
       ? restPausedRemaining
       : showLockScreen && restEndAt
         ? (restEndAt.getTime() - now.getTime()) / 1000
-        : restDuration * 60;
+        : restDuration;
   const restCountdown = formatDuration(restCountdownSeconds);
 
   const timeText = now.toLocaleTimeString("zh-CN", {
@@ -2912,14 +2912,14 @@ function App() {
                       <input
                         className="pill__input"
                         type="number"
-                        min={3}
-                        max={20}
+                        min={20}
+                        max={300}
                         value={restDuration}
                         onChange={(event) =>
                           setRestDuration(Number(event.target.value))
                         }
                       />
-                      <span>分钟</span>
+                      <span>秒</span>
                     </div>
                   </div>
 
