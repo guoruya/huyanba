@@ -10,6 +10,9 @@
     "core:menu:default",
     "core:tray:default",
     "core:window:default",
+    "autostart:allow-enable",
+    "autostart:allow-disable",
+    "autostart:allow-is-enabled",
     "dialog:default",
     "opener:default"
   ]

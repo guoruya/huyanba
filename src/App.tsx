@@ -8,6 +8,11 @@ import {
 } from "react";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import {
+  disable as disableAutostart,
+  enable as enableAutostart,
+  isEnabled as isAutostartEnabled,
+} from "@tauri-apps/plugin-autostart";
 import { open } from "@tauri-apps/plugin-dialog";
 import "./App.css";
 
@@ -162,14 +167,61 @@ type WallpaperStorageUpdateResult = {
   restoredDefault: boolean;
 };
 
-type UnsplashConfigSource = "appConfig" | "envLocal" | "env" | "builtIn" | "none";
+type UnsplashConfigSource = "appConfig" | "envLocal" | "env" | "none";
 
 type UnsplashSettings = {
   effectiveConfigured: boolean;
   configSource: UnsplashConfigSource;
   hasStoredKey: boolean;
   maskedStoredKey?: string | null;
-  isBuiltIn: boolean;
+  palaceEnabled: boolean;
+};
+
+type AppSettings = {
+  filterEnabled: boolean;
+  filterStrength: number;
+  colorTemperature: number;
+  filterPreset: string;
+  restEnabled: boolean;
+  workIntervalMinutes: number;
+  restDurationSeconds: number;
+  allowEsc: boolean;
+};
+
+type SchedulerPhase = "disabled" | "working" | "resting" | "sleeping";
+
+type SchedulerState = {
+  restEnabled: boolean;
+  workIntervalMinutes: number;
+  restDurationSeconds: number;
+  allowEsc: boolean;
+  phase: SchedulerPhase;
+  nextRestAtMs?: number | null;
+  restEndAtMs?: number | null;
+  paused: boolean;
+  pausedRemainingMs?: number | null;
+  observedAtMs: number;
+};
+
+type SchedulerEvent = {
+  event: "restStarted" | "restFinished" | "stateChanged";
+  state: SchedulerState;
+  reason?: string;
+};
+
+type DisplayFilterFailure = {
+  displayId?: number | null;
+  operation: string;
+  errorCode?: number | null;
+  message: string;
+};
+
+type DisplayFilterStatus = {
+  enabled: boolean;
+  appliedDisplayIds: number[];
+  restoredDisplayIds: number[];
+  failures: DisplayFilterFailure[];
+  colorSyncFallbackUsed: boolean;
 };
 
 const WALLPAPER_PAGE_SIZE = 12;
@@ -256,7 +308,6 @@ function describeUnsplashConfigSource(source: UnsplashConfigSource) {
   if (source === "appConfig") return "应用内配置";
   if (source === "envLocal") return ".env.local";
   if (source === "env") return "环境变量";
-  if (source === "builtIn") return "内置 Key";
   return "未配置";
 }
 
@@ -272,14 +323,23 @@ function App() {
   const [restMinutes, setRestMinutes] = useState(30);
   const [restDuration, setRestDuration] = useState(60);
   const [allowEscExit, setAllowEscExit] = useState(true);
-  const [showLockScreen, setShowLockScreen] = useState(false);
   const [activePreset, setActivePreset] = useState("智能");
   const [nextRestAt, setNextRestAt] = useState<Date | null>(null);
-  const [restEndAt, setRestEndAt] = useState<Date | null>(null);
-  const [restPaused, setRestPaused] = useState(false);
-  const [restPausedRemaining, setRestPausedRemaining] = useState<number | null>(
+  const [schedulerState, setSchedulerState] = useState<SchedulerState | null>(
     null,
   );
+  const [settingsReady, setSettingsReady] = useState(false);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
+  const [filterStatusMessage, setFilterStatusMessage] = useState<string | null>(
+    null,
+  );
+  const filterAutoDisablePendingRef = useRef(false);
+  const [autostartEnabled, setAutostartEnabled] = useState(false);
+  const [autostartReady, setAutostartReady] = useState(false);
+  const [autostartPending, setAutostartPending] = useState(false);
+  const [autostartError, setAutostartError] = useState<string | null>(null);
+  const autostartPendingRef = useRef(false);
+  const autostartGenerationRef = useRef(0);
   const [lockPayload, setLockPayload] = useState({
     timeText: "--:--",
     dateText: "",
@@ -290,6 +350,9 @@ function App() {
   const [lockEndAtMs, setLockEndAtMs] = useState<number | null>(null);
   const [lockPausedLocal, setLockPausedLocal] = useState(false);
   const [lockRemainingLocal, setLockRemainingLocal] = useState(0);
+  const [lockPausePending, setLockPausePending] = useState(false);
+  const [lockPauseError, setLockPauseError] = useState<string | null>(null);
+  const lockPausePendingRef = useRef(false);
   const [lockBackgroundUrl, setLockBackgroundUrl] = useState<string | null>(
     null,
   );
@@ -379,12 +442,10 @@ function App() {
     "muted" | "success" | "error"
   >("muted");
   const [wallpaperActionMessage, setWallpaperActionMessage] = useState(
-    "Unsplash 可以直接下载到本地；故宫会先展示候选批次，再决定是否加入壁纸库。",
+    "Unsplash 可以搜索并下载到本地；已保存壁纸可继续在本地库管理。",
   );
-  const exitInProgressRef = useRef(false);
-  const exitRestRef = useRef<() => void>(() => {});
-  const togglePauseRef = useRef<() => void>(() => {});
   const palaceRefreshIntentRef = useRef<"auto" | "manual" | "page" | null>(null);
+  const palaceWallpaperSourceEnabled = unsplashSettings?.palaceEnabled ?? false;
 
   const presets = useMemo(
     () => ({
@@ -423,6 +484,79 @@ function App() {
     [isDaytime, presets],
   );
 
+  const applySchedulerState = useCallback((state: SchedulerState) => {
+    setSchedulerState(state);
+    setRestEnabled(state.restEnabled);
+    setRestMinutes(state.workIntervalMinutes);
+    setRestDuration(state.restDurationSeconds);
+    setAllowEscExit(state.allowEsc);
+    setNextRestAt(
+      state.nextRestAtMs == null ? null : new Date(state.nextRestAtMs),
+    );
+  }, []);
+
+  const applyLockSchedulerState = useCallback((state: SchedulerState) => {
+    setLockEndAtMs(state.restEndAtMs ?? null);
+    setLockPausedLocal(state.paused);
+    setLockRemainingLocal(
+      state.pausedRemainingMs == null
+        ? 0
+        : Math.ceil(state.pausedRemainingMs / 1000),
+    );
+    setLockPayload((previous) => ({
+      ...previous,
+      restPaused: state.paused,
+      allowEscExit: state.allowEsc,
+    }));
+  }, []);
+
+  const applyAppSettings = useCallback((settings: AppSettings) => {
+    setFilterEnabled(settings.filterEnabled);
+    setFilterStrength(settings.filterStrength);
+    setColorTemp(settings.colorTemperature);
+    setActivePreset(settings.filterPreset);
+    setRestEnabled(settings.restEnabled);
+    setRestMinutes(settings.workIntervalMinutes);
+    setRestDuration(settings.restDurationSeconds);
+    setAllowEscExit(settings.allowEsc);
+  }, []);
+
+  const applyDisplayFilterStatus = useCallback(
+    (status: DisplayFilterStatus) => {
+      if (!status.enabled) {
+        setFilterEnabled(false);
+      }
+      if (status.failures.length === 0) {
+        if (!status.enabled && filterAutoDisablePendingRef.current) {
+          filterAutoDisablePendingRef.current = false;
+          return;
+        }
+        filterAutoDisablePendingRef.current = false;
+        setFilterStatusMessage(null);
+        return;
+      }
+      const failedDisplays = status.failures
+        .map((failure) => failure.displayId)
+        .filter((displayId): displayId is number => displayId != null);
+      if (status.enabled && status.appliedDisplayIds.length === 0) {
+        filterAutoDisablePendingRef.current = true;
+        setFilterEnabled(false);
+        setFilterStatusMessage(
+          `系统未能应用滤镜，已自动关闭。${status.failures[0]?.message ?? ""}`,
+        );
+        return;
+      }
+      const displaySummary =
+        failedDisplays.length > 0
+          ? `显示器 ${[...new Set(failedDisplays)].join("、")}`
+          : "系统显示服务";
+      setFilterStatusMessage(
+        `${displaySummary}处理失败，其他显示器仍保持当前设置。${status.failures[0]?.message ?? ""}`,
+      );
+    },
+    [],
+  );
+
   useEffect(() => {
     if (activePreset !== "智能") return;
     const next = resolvePreset("智能");
@@ -431,13 +565,77 @@ function App() {
   }, [activePreset, resolvePreset]);
 
   const handleStartRest = useCallback(() => {
-    exitInProgressRef.current = false;
-    const endAt = new Date(Date.now() + restDuration * 1000);
-    setRestPaused(false);
-    setRestPausedRemaining(null);
-    setRestEndAt(endAt);
-    setShowLockScreen(true);
-  }, [restDuration]);
+    invoke<SchedulerState>("start_rest_now")
+      .then(applySchedulerState)
+      .catch((error) => setSettingsError(extractErrorMessage(error)));
+  }, [applySchedulerState]);
+
+  useEffect(() => {
+    if (isLockWindow) return;
+    let active = true;
+    let settingsLoaded = true;
+    void Promise.all([
+      invoke<AppSettings>("get_app_settings")
+        .then((settings) => {
+          if (active) applyAppSettings(settings);
+        })
+        .catch((error) => {
+          settingsLoaded = false;
+          if (active) setSettingsError(extractErrorMessage(error));
+        }),
+      invoke<DisplayFilterStatus>("get_display_filter_status")
+        .then((status) => {
+          if (active) applyDisplayFilterStatus(status);
+        })
+        .catch((error) => {
+          if (active) setFilterStatusMessage(extractErrorMessage(error));
+        }),
+    ]).finally(() => {
+      if (active) setSettingsReady(settingsLoaded);
+    });
+    return () => {
+      active = false;
+    };
+  }, [
+    applyAppSettings,
+    applyDisplayFilterStatus,
+    isLockWindow,
+  ]);
+
+  useEffect(() => {
+    if (isLockWindow) return;
+    let active = true;
+    const generation = ++autostartGenerationRef.current;
+    autostartPendingRef.current = true;
+    setAutostartReady(false);
+    setAutostartPending(true);
+    setAutostartError(null);
+
+    void isAutostartEnabled()
+      .then((enabled) => {
+        if (active && autostartGenerationRef.current === generation) {
+          setAutostartEnabled(enabled);
+        }
+      })
+      .catch((error) => {
+        if (active && autostartGenerationRef.current === generation) {
+          setAutostartError(extractErrorMessage(error));
+        }
+      })
+      .finally(() => {
+        if (active && autostartGenerationRef.current === generation) {
+          autostartPendingRef.current = false;
+          setAutostartPending(false);
+          setAutostartReady(true);
+        }
+      });
+
+    return () => {
+      active = false;
+      autostartGenerationRef.current += 1;
+      autostartPendingRef.current = false;
+    };
+  }, [isLockWindow]);
 
   const selectedUnsplashWallpaper = useMemo(
     () =>
@@ -490,6 +688,9 @@ function App() {
     try {
       const settings = await invoke<UnsplashSettings>("get_unsplash_settings");
       setUnsplashSettings(settings);
+      if (!settings.palaceEnabled) {
+        setActiveRemoteSource("unsplash");
+      }
       return settings;
     } catch (error) {
       console.error("加载 Unsplash 配置失败", error);
@@ -575,7 +776,7 @@ function App() {
             ? prev
             : result.items[0]?.id ?? null,
         );
-        if (!result.configured) {
+        if (!result.configured && palaceWallpaperSourceEnabled) {
           setActiveRemoteSource((prev) =>
             prev === "unsplash" ? "palace" : prev,
           );
@@ -587,7 +788,7 @@ function App() {
         setUnsplashSearchLoading(false);
       }
     },
-    [isLockWindow],
+    [isLockWindow, palaceWallpaperSourceEnabled],
   );
 
   const applyPalaceStagingResult = useCallback(
@@ -677,7 +878,7 @@ function App() {
   );
 
   const loadPalaceStagingWallpapers = useCallback(async () => {
-    if (isLockWindow) {
+    if (isLockWindow || !palaceWallpaperSourceEnabled) {
       return {
         fetched: 0,
         replacedPreviousBatch: false,
@@ -719,6 +920,7 @@ function App() {
   }, [
     applyPalaceStagingResult,
     isLockWindow,
+    palaceWallpaperSourceEnabled,
     palaceStagingHasNextPage,
     palaceStagingHasPrevPage,
     palaceStagingMaxPage,
@@ -727,7 +929,7 @@ function App() {
   ]);
 
   const loadPalaceRefreshStatus = useCallback(async () => {
-    if (isLockWindow) {
+    if (isLockWindow || !palaceWallpaperSourceEnabled) {
       const status = {
         state: "idle",
         targetPage: 1,
@@ -759,14 +961,19 @@ function App() {
       } satisfies PalaceStagingRefreshStatus;
       return applyPalaceRefreshStatus(fallback);
     }
-  }, [applyPalaceRefreshStatus, isLockWindow, palaceStagingPage]);
+  }, [
+    applyPalaceRefreshStatus,
+    isLockWindow,
+    palaceStagingPage,
+    palaceWallpaperSourceEnabled,
+  ]);
 
   const refreshPalaceStagingBatch = useCallback(
     async (
       reason: "auto" | "manual" | "page" = "manual",
       page?: number,
     ) => {
-      if (isLockWindow) {
+      if (isLockWindow || !palaceWallpaperSourceEnabled) {
         return {
           state: "idle",
           targetPage: 1,
@@ -814,6 +1021,7 @@ function App() {
       applyPalaceRefreshStatus,
       isLockWindow,
       palaceStagingPage,
+      palaceWallpaperSourceEnabled,
     ],
   );
 
@@ -827,7 +1035,7 @@ function App() {
       if (result.listSuccesses === 0) {
         return;
       }
-      if (result.sourceKind === "palace") {
+      if (result.sourceKind === "palace" && palaceWallpaperSourceEnabled) {
         setActiveView("wallpapers");
         setActiveRemoteSource("palace");
         setPalaceStagingBootstrapped(true);
@@ -844,6 +1052,7 @@ function App() {
     isLockWindow,
     loadLocalWallpapers,
     loadPalaceStagingWallpapers,
+    palaceWallpaperSourceEnabled,
     unsplashSearchResult,
     wallpaperRefreshPending,
   ]);
@@ -1045,9 +1254,15 @@ function App() {
           void runUnsplashSearch(unsplashSearchInput, 1);
         }
       } else {
-        setUnsplashSettingsMessage("已清除应用内 Access Key，当前会继续使用故宫来源。");
-        if (activeRemoteSource === "unsplash") {
+        setUnsplashSettingsMessage(
+          settings.palaceEnabled
+            ? "已清除应用内 Access Key，当前会继续使用故宫来源。"
+            : "已清除应用内 Access Key；macOS 需要重新配置 Access Key 才能获取在线壁纸。",
+        );
+        if (settings.palaceEnabled && activeRemoteSource === "unsplash") {
           setActiveRemoteSource("palace");
+        } else if (!settings.palaceEnabled) {
+          setActiveRemoteSource("unsplash");
         }
       }
     } catch (error) {
@@ -1370,105 +1585,124 @@ function App() {
     [loadLocalWallpapers, localWallpapers],
   );
 
-  const handleExitRest = useCallback(() => {
-    if (exitInProgressRef.current) return;
-    exitInProgressRef.current = true;
-    invoke("log_app", { message: "前端退出休息: start" }).catch(() => undefined);
-    setShowLockScreen(false);
-    setRestPaused(false);
-    setRestPausedRemaining(null);
-    setRestEndAt(null);
-    if (restEnabled) {
-      setNextRestAt(new Date(Date.now() + restMinutes * 60 * 1000));
-    } else {
-      setNextRestAt(null);
-    }
-    if (!isLockWindow) {
-      invoke("set_gamma", {
-        filterEnabled,
-        strength: filterStrength,
-        colorTemp,
-      }).catch(() => undefined);
-    }
-    invoke("log_app", { message: "前端退出休息: end" }).catch(() => undefined);
-  }, [
-    restEnabled,
-    restMinutes,
-    isLockWindow,
-    filterEnabled,
-    filterStrength,
-    colorTemp,
-  ]);
-
-  const handleTogglePause = useCallback(() => {
-    if (!showLockScreen) return;
-    if (restPaused) {
-      if (restPausedRemaining === null) return;
-      setRestEndAt(new Date(Date.now() + restPausedRemaining * 1000));
-      setRestPaused(false);
-      setRestPausedRemaining(null);
-      return;
-    }
-    if (!restEndAt) return;
-    const remaining = Math.max(
-      0,
-      Math.floor((restEndAt.getTime() - Date.now()) / 1000),
-    );
-    setRestPausedRemaining(remaining);
-    setRestEndAt(null);
-    setRestPaused(true);
-  }, [restEndAt, restPaused, restPausedRemaining, showLockScreen]);
-
-  useEffect(() => {
-    exitRestRef.current = handleExitRest;
-  }, [handleExitRest]);
-
-  useEffect(() => {
-    togglePauseRef.current = handleTogglePause;
-  }, [handleTogglePause]);
-
   useEffect(() => {
     const timer = setInterval(() => setNow(new Date()), 1000);
     return () => clearInterval(timer);
   }, []);
 
   useEffect(() => {
-    if (showLockScreen) {
-      exitInProgressRef.current = false;
-    }
-  }, [showLockScreen]);
-
-  useEffect(() => {
-    if (isLockWindow) return;
-    const reset = () => {
-      invoke("reset_gamma").catch(() => undefined);
-    };
-    window.addEventListener("beforeunload", reset);
-    return () => {
-      window.removeEventListener("beforeunload", reset);
-      reset();
-    };
-  }, [isLockWindow]);
-
-  useEffect(() => {
-    if (isLockWindow) return;
+    if (isLockWindow || !settingsReady) return;
     let active = true;
     const handle = setTimeout(() => {
-      invoke("set_gamma", {
+      invoke<DisplayFilterStatus>("set_gamma_with_status", {
         filterEnabled,
         strength: filterStrength,
         colorTemp,
-      }).catch((error) => {
-        if (active) {
+      })
+        .then((status) => {
+          if (active) applyDisplayFilterStatus(status);
+        })
+        .catch((error) => {
+          if (!active) return;
           console.error("过滤蓝光设置失败", error);
-        }
-      });
+          filterAutoDisablePendingRef.current = true;
+          setFilterEnabled(false);
+          setFilterStatusMessage(
+            `系统未能应用滤镜，已自动关闭。${extractErrorMessage(error)}`,
+          );
+        });
     }, 80);
     return () => {
       active = false;
       clearTimeout(handle);
     };
-  }, [isLockWindow, filterEnabled, filterStrength, colorTemp]);
+  }, [
+    applyDisplayFilterStatus,
+    colorTemp,
+    filterEnabled,
+    filterStrength,
+    isLockWindow,
+    settingsReady,
+  ]);
+
+  useEffect(() => {
+    if (isLockWindow || !settingsReady) return;
+    let active = true;
+    const handle = window.setTimeout(() => {
+      const settings: AppSettings = {
+        filterEnabled,
+        filterStrength,
+        colorTemperature: colorTemp,
+        filterPreset: activePreset,
+        restEnabled,
+        workIntervalMinutes: restMinutes,
+        restDurationSeconds: restDuration,
+        allowEsc: allowEscExit,
+      };
+      invoke<AppSettings>("update_app_settings", { settings })
+        .then(() => {
+          if (active) setSettingsError(null);
+        })
+        .catch((error) => {
+          if (active) setSettingsError(extractErrorMessage(error));
+        });
+    }, 180);
+    return () => {
+      active = false;
+      window.clearTimeout(handle);
+    };
+  }, [
+    activePreset,
+    allowEscExit,
+    colorTemp,
+    filterEnabled,
+    filterStrength,
+    isLockWindow,
+    restDuration,
+    restEnabled,
+    restMinutes,
+    settingsReady,
+  ]);
+
+  const handleAutostartChange = useCallback(async () => {
+    if (!autostartReady || autostartPendingRef.current) return;
+    const previous = autostartEnabled;
+    const next = !previous;
+    const generation = ++autostartGenerationRef.current;
+    autostartPendingRef.current = true;
+    setAutostartEnabled(next);
+    setAutostartPending(true);
+    setAutostartError(null);
+    let operationApplied = false;
+    try {
+      if (next) {
+        await enableAutostart();
+      } else {
+        await disableAutostart();
+      }
+      operationApplied = true;
+      const verified = await isAutostartEnabled();
+      if (autostartGenerationRef.current === generation) {
+        setAutostartEnabled(verified);
+      }
+    } catch (error) {
+      if (autostartGenerationRef.current === generation) {
+        if (!operationApplied) {
+          setAutostartEnabled(previous);
+        }
+        setAutostartError(
+          operationApplied
+            ? `系统设置已更新，但暂时无法确认当前状态：${extractErrorMessage(error)}`
+            : extractErrorMessage(error),
+        );
+      }
+    } finally {
+      if (autostartGenerationRef.current === generation) {
+        autostartPendingRef.current = false;
+        setAutostartPending(false);
+      }
+    }
+  }, [autostartEnabled, autostartReady]);
 
   useEffect(() => {
     if (isLockWindow) return;
@@ -1519,7 +1753,13 @@ function App() {
   ]);
 
   useEffect(() => {
-    if (isLockWindow || activeView !== "wallpapers") return;
+    if (
+      isLockWindow ||
+      activeView !== "wallpapers" ||
+      !palaceWallpaperSourceEnabled
+    ) {
+      return;
+    }
     if (
       activeRemoteSource !== "palace" &&
       unsplashSettings?.effectiveConfigured !== false
@@ -1532,78 +1772,130 @@ function App() {
     activeView,
     isLockWindow,
     loadPalaceRefreshStatus,
+    palaceWallpaperSourceEnabled,
     unsplashSettings?.effectiveConfigured,
   ]);
 
   useEffect(() => {
-    if (isLockWindow) return;
-    if (showLockScreen) {
-      const endAt = restEndAt ?? new Date(Date.now() + restDuration * 1000);
-      invoke("show_lock_windows", {
-        endAtMs: endAt.getTime(),
-        paused: restPaused,
-        pausedRemaining: restPausedRemaining || 0,
-        allowEsc: allowEscExit,
-      }).catch((error) => console.error("锁屏窗口创建失败", error));
-    } else {
-      invoke("log_app", { message: "前端请求关闭锁屏" }).catch(() => undefined);
-      invoke("hide_lock_windows").catch((error) =>
-        console.error("锁屏窗口关闭失败", error),
-      );
-    }
-  }, [
-    isLockWindow,
-    showLockScreen,
-    restEndAt,
-    restDuration,
-    restPaused,
-    restPausedRemaining,
-    allowEscExit,
-  ]);
-
-  useEffect(() => {
-    if (isLockWindow) return;
+    let active = true;
     let unlisten: (() => void) | undefined;
-    const window = getCurrentWebviewWindow();
-    window
-      .listen<string>("lockscreen-action", (event) => {
-        if (event.payload === "exit") {
-          exitRestRef.current();
-        } else if (event.payload === "toggle_pause") {
-          togglePauseRef.current();
+    let schedulerEventGeneration = 0;
+    const currentWindow = getCurrentWebviewWindow();
+
+    void (async () => {
+      try {
+        const stopListening = await currentWindow.listen<SchedulerEvent>(
+          "rest-scheduler-event",
+          (event) => {
+            if (!active) return;
+            schedulerEventGeneration += 1;
+            const state = event.payload.state;
+            if (isLockWindow) {
+              applyLockSchedulerState(state);
+            } else {
+              applySchedulerState(state);
+            }
+          },
+        );
+        if (!active) {
+          stopListening();
+          return;
         }
-      })
-      .then((fn) => {
-        unlisten = fn;
-      })
-      .catch((error) => console.error("监听锁屏动作失败", error));
+        unlisten = stopListening;
+
+        const generationAtRequest = schedulerEventGeneration;
+        const state = await invoke<SchedulerState>("get_scheduler_state");
+        if (active && schedulerEventGeneration === generationAtRequest) {
+          if (isLockWindow) {
+            applyLockSchedulerState(state);
+          } else {
+            applySchedulerState(state);
+          }
+        }
+      } catch (error) {
+        console.error("同步 Rust 休息调度状态失败", error);
+        if (active && !isLockWindow) {
+          setSettingsError(extractErrorMessage(error));
+        }
+      }
+    })();
 
     return () => {
-      if (unlisten) {
-        unlisten();
-      }
+      active = false;
+      unlisten?.();
     };
-  }, [isLockWindow]);
+  }, [applyLockSchedulerState, applySchedulerState, isLockWindow]);
 
   useEffect(() => {
     if (isLockWindow) return;
+    let active = true;
+    let unlisteners: Array<() => void> = [];
+    const currentWindow = getCurrentWebviewWindow();
+    const register = async (registration: Promise<() => void>) => {
+      try {
+        const unlisten = await registration;
+        if (active) {
+          unlisteners.push(unlisten);
+        } else {
+          unlisten();
+        }
+      } catch (error) {
+        console.error("监听后端状态事件失败", error);
+      }
+    };
+    void register(
+      currentWindow.listen<DisplayFilterStatus>(
+        "display-filter-status",
+        (event) => applyDisplayFilterStatus(event.payload),
+      ),
+    );
+    void register(
+      currentWindow.listen<string>("display-filter-error", (event) =>
+        setFilterStatusMessage(event.payload),
+      ),
+    );
+    void register(
+      currentWindow.listen<string>("rest-scheduler-error", (event) =>
+        setSettingsError(event.payload),
+      ),
+    );
+    void register(
+      currentWindow.listen<AppSettings>("app-settings-updated", (event) =>
+        applyAppSettings(event.payload),
+      ),
+    );
+    return () => {
+      active = false;
+      unlisteners.forEach((unlisten) => unlisten());
+      unlisteners = [];
+    };
+  }, [applyAppSettings, applyDisplayFilterStatus, isLockWindow]);
+
+  useEffect(() => {
+    if (isLockWindow) return;
+    let active = true;
     let unlisten: (() => void) | undefined;
     getCurrentWebviewWindow()
       .listen<WallpaperStorageSettings>("wallpaper-storage-updated", () => {
         void loadWallpaperStorageSettings();
         void loadLocalWallpapers();
-        void loadPalaceStagingWallpapers();
-        void loadPalaceRefreshStatus();
-        setPalaceStagingBootstrapped(false);
+        if (palaceWallpaperSourceEnabled) {
+          void loadPalaceStagingWallpapers();
+          void loadPalaceRefreshStatus();
+          setPalaceStagingBootstrapped(false);
+        }
       })
       .then((fn) => {
-        unlisten = fn;
+        if (active) {
+          unlisten = fn;
+        } else {
+          fn();
+        }
       })
       .catch((error) => console.error("监听壁纸目录变更失败", error));
     return () => {
-      if (unlisten) {
-        unlisten();
-      }
+      active = false;
+      unlisten?.();
     };
   }, [
     isLockWindow,
@@ -1611,25 +1903,34 @@ function App() {
     loadPalaceRefreshStatus,
     loadPalaceStagingWallpapers,
     loadWallpaperStorageSettings,
+    palaceWallpaperSourceEnabled,
   ]);
 
   useEffect(() => {
-    if (isLockWindow) return;
+    if (isLockWindow || !palaceWallpaperSourceEnabled) return;
+    let active = true;
     let unlisten: (() => void) | undefined;
     getCurrentWebviewWindow()
       .listen<PalaceStagingRefreshStatus>("palace-staging-refresh", (event) => {
         applyPalaceRefreshStatus(event.payload);
       })
       .then((fn) => {
-        unlisten = fn;
+        if (active) {
+          unlisten = fn;
+        } else {
+          fn();
+        }
       })
       .catch((error) => console.error("监听故宫后台刷新事件失败", error));
     return () => {
-      if (unlisten) {
-        unlisten();
-      }
+      active = false;
+      unlisten?.();
     };
-  }, [applyPalaceRefreshStatus, isLockWindow]);
+  }, [
+    applyPalaceRefreshStatus,
+    isLockWindow,
+    palaceWallpaperSourceEnabled,
+  ]);
 
   useEffect(() => {
     if (!isLockWindow) return;
@@ -1667,14 +1968,16 @@ function App() {
         );
       })
       .then((fn) => {
-        unlisten = fn;
+        if (active) {
+          unlisten = fn;
+        } else {
+          fn();
+        }
       })
       .catch((error) => console.error("监听壁纸目录更新失败", error));
     return () => {
       active = false;
-      if (unlisten) {
-        unlisten();
-      }
+      unlisten?.();
     };
   }, [isLockWindow, reloadLockWallpaperFromStorage]);
 
@@ -1707,6 +2010,22 @@ function App() {
     setLockWallpaperIndex(nextIndex);
     setLockBackgroundUrl(lockWallpaperHistory[nextIndex]);
   }, [isLockWindow, lockWallpaperHistory, lockWallpaperIndex]);
+
+  const handleToggleRestPause = useCallback(async () => {
+    if (!isLockWindow || lockPausePendingRef.current) return;
+    lockPausePendingRef.current = true;
+    setLockPausePending(true);
+    setLockPauseError(null);
+    try {
+      const state = await invoke<SchedulerState>("toggle_rest_pause");
+      applyLockSchedulerState(state);
+    } catch (error) {
+      setLockPauseError(extractErrorMessage(error));
+    } finally {
+      lockPausePendingRef.current = false;
+      setLockPausePending(false);
+    }
+  }, [applyLockSchedulerState, isLockWindow]);
 
   useEffect(() => {
     if (!isLockWindow) return;
@@ -1754,77 +2073,13 @@ function App() {
     return () => window.removeEventListener("keydown", onKeydown);
   }, [isLockWindow, lockPayload.allowEscExit]);
 
-  // 全局快捷键已取消
-
-  useEffect(() => {
-    if (showLockScreen) return;
-    if (!restEnabled) {
-      setNextRestAt(null);
-      return;
-    }
-    const next = new Date(Date.now() + restMinutes * 60 * 1000);
-    setNextRestAt(next);
-  }, [showLockScreen, restEnabled, restMinutes]);
-
-  useEffect(() => {
-    if (!restEnabled || showLockScreen) return;
-    if (!nextRestAt) return;
-    if (now.getTime() >= nextRestAt.getTime()) {
-      const endAt = new Date(Date.now() + restDuration * 1000);
-      setRestPaused(false);
-      setRestPausedRemaining(null);
-      setRestEndAt(endAt);
-      setShowLockScreen(true);
-    }
-  }, [now, restEnabled, nextRestAt, restDuration, showLockScreen]);
-
-  useEffect(() => {
-    if (!showLockScreen || !restEndAt) return;
-    if (restPaused) return;
-    if (now.getTime() >= restEndAt.getTime()) {
-      handleExitRest();
-    }
-  }, [handleExitRest, now, restPaused, restEndAt, showLockScreen]);
-
-  useEffect(() => {
-    if (!showLockScreen) return;
-    if (restPaused) {
-      setRestPausedRemaining(restDuration);
-      return;
-    }
-    setRestEndAt(new Date(Date.now() + restDuration * 1000));
-  }, [restDuration, showLockScreen, restPaused]);
-
-  useEffect(() => {
-    if (!showLockScreen) return;
-    function onKeydown(event: KeyboardEvent) {
-      if (!allowEscExit) return;
-      if (event.key === "Escape") {
-        handleExitRest();
-      }
-    }
-    window.addEventListener("keydown", onKeydown);
-    return () => window.removeEventListener("keydown", onKeydown);
-  }, [showLockScreen, allowEscExit, handleExitRest]);
-
-  useEffect(() => {
-    if (showLockScreen) return;
-    if (!restEnabled || !nextRestAt) return;
-    if (now.getTime() < nextRestAt.getTime()) return;
-    setNextRestAt(new Date(Date.now() + restMinutes * 60 * 1000));
-  }, [now, showLockScreen, restEnabled, nextRestAt, restMinutes]);
-
-  const nextRestCountdown = restEnabled && nextRestAt
-    ? formatDuration((nextRestAt.getTime() - now.getTime()) / 1000)
-    : "已暂停";
-
-  const restCountdownSeconds =
-    showLockScreen && restPaused && restPausedRemaining !== null
-      ? restPausedRemaining
-      : showLockScreen && restEndAt
-        ? (restEndAt.getTime() - now.getTime()) / 1000
-        : restDuration;
-  const restCountdown = formatDuration(restCountdownSeconds);
+  // Rust owns all expiry decisions. This timer only renders absolute deadlines.
+  const nextRestCountdown =
+    schedulerState?.phase === "sleeping"
+      ? "系统休眠"
+      : restEnabled && nextRestAt
+        ? formatDuration((nextRestAt.getTime() - now.getTime()) / 1000)
+        : "已暂停";
 
   const timeText = now.toLocaleTimeString("zh-CN", {
     hour: "2-digit",
@@ -1839,18 +2094,24 @@ function App() {
   const isUnsplashConfigured =
     unsplashSettings?.effectiveConfigured ??
     unsplashSearchResult?.configured ??
-    true;
+    false;
   const unsplashConfigSourceLabel = describeUnsplashConfigSource(
     unsplashSettings?.configSource ?? "none",
   );
   const canLoadPrevUnsplashPage = (unsplashSearchResult?.page ?? 1) > 1;
   const canLoadNextUnsplashPage = unsplashSearchResult?.hasNextPage ?? false;
-  const refreshSourceLabel = isUnsplashConfigured ? "Unsplash" : "故宫壁纸";
+  const refreshSourceLabel =
+    isUnsplashConfigured || !palaceWallpaperSourceEnabled
+      ? "Unsplash"
+      : "故宫壁纸";
   const refreshActionLabel = isUnsplashConfigured
     ? `下载 ${refreshSourceLabel} 新壁纸`
-    : "获取故宫候选壁纸";
+    : palaceWallpaperSourceEnabled
+      ? "获取故宫候选壁纸"
+      : "配置 Unsplash Access Key";
   const hasPalaceCandidates = palaceStagingWallpapers.length > 0;
-  const isPalaceRefreshRunning = palaceRefreshStatus?.state === "running";
+  const isPalaceRefreshRunning =
+    palaceWallpaperSourceEnabled && palaceRefreshStatus?.state === "running";
   const palaceRefreshTargetPage =
     palaceRefreshStatus?.targetPage ?? palaceStagingPage;
   const palaceControlsDisabled = palaceStagingLoading || isPalaceRefreshRunning;
@@ -1873,50 +2134,6 @@ function App() {
     : null;
   const isUsingDefaultWallpaperDir = wallpaperStorageSettings?.isDefault ?? true;
 
-  useEffect(() => {
-    if (isLockWindow) return;
-    if (!showLockScreen) return;
-    invoke("broadcast_lock_update", {
-      timeText,
-      dateText,
-      restCountdown,
-      restPaused,
-      allowEscExit,
-    }).catch((error) => console.error("锁屏数据同步失败", error));
-  }, [
-    isLockWindow,
-    showLockScreen,
-    timeText,
-    dateText,
-    restCountdown,
-    restPaused,
-    allowEscExit,
-  ]);
-
-
-  useEffect(() => {
-    if (isLockWindow) return;
-    if (!showLockScreen) return;
-    const timer = setInterval(() => {
-      invoke("broadcast_lock_update", {
-        timeText,
-        dateText,
-        restCountdown,
-        restPaused,
-        allowEscExit,
-      }).catch((error) => console.error("锁屏数据同步失败", error));
-    }, 1000);
-    return () => clearInterval(timer);
-  }, [
-    isLockWindow,
-    showLockScreen,
-    timeText,
-    dateText,
-    restCountdown,
-    restPaused,
-    allowEscExit,
-  ]);
-
   const wallpaperConsoleContent = (
     <section className="wallpaper-console">
       <div className="card wallpaper-console__toolbar">
@@ -1924,7 +2141,9 @@ function App() {
           <p className="card__eyebrow">壁纸控制台</p>
           <h2>在线搜索与本地管理</h2>
           <p className="helper-text">
-            Unsplash 保持在线搜索；故宫会先在后台抓一批候选图，再用本地文件预览和挑选。
+            {palaceWallpaperSourceEnabled
+              ? "Unsplash 保持在线搜索；故宫会先在后台抓一批候选图，再用本地文件预览和挑选。"
+              : "macOS 当前仅启用 Unsplash 在线搜索和本地壁纸管理。"}
           </p>
         </div>
         <div className="wallpaper-source-tabs">
@@ -1943,21 +2162,25 @@ function App() {
           >
             Unsplash
           </button>
-          <button
-            className={`view-tab ${
-              activeRemoteSource === "palace" ? "view-tab--active" : ""
-            }`}
-            type="button"
-            onClick={() => {
-              setActiveRemoteSource("palace");
-            }}
-          >
-            故宫壁纸
-          </button>
+          {palaceWallpaperSourceEnabled ? (
+            <button
+              className={`view-tab ${
+                activeRemoteSource === "palace" ? "view-tab--active" : ""
+              }`}
+              type="button"
+              onClick={() => {
+                setActiveRemoteSource("palace");
+              }}
+            >
+              故宫壁纸
+            </button>
+          ) : null}
         </div>
         {!isUnsplashConfigured && (
           <p className="helper-text">
-            Unsplash 需要先配置 Access Key。你可以在“壁纸设置”里填写，当前会自动使用故宫来源。
+            {palaceWallpaperSourceEnabled
+              ? "Unsplash 需要先配置 Access Key。你可以在“壁纸设置”里填写，当前会自动使用故宫来源。"
+              : "macOS 需要先在“壁纸设置”中填写 Unsplash Access Key，才能搜索和下载在线壁纸。"}
           </p>
         )}
         {activeRemoteSource === "unsplash" ? (
@@ -2152,11 +2375,11 @@ function App() {
               )
             ) : (
               <button
-                className="btn btn--primary"
-                type="button"
-                onClick={handleRefreshWallpaper}
-                disabled={wallpaperRefreshPending}
-              >
+              className="btn btn--primary"
+              type="button"
+              onClick={handleRefreshWallpaper}
+              disabled={wallpaperRefreshPending || !isUnsplashConfigured}
+            >
                 {wallpaperRefreshPending ? "下载中..." : refreshActionLabel}
               </button>
             )}
@@ -2233,29 +2456,15 @@ function App() {
               <div>
                 <p className="card__eyebrow">Unsplash Access Key</p>
                 <strong>
-                {unsplashSettings?.isBuiltIn
-                  ? "内置 Key 已激活"
-                  : isUnsplashConfigured
-                    ? "已配置"
-                    : "未配置"}
+                {isUnsplashConfigured ? "已配置" : "未配置"}
               </strong>
               </div>
               <span className="helper-text">当前来源：{unsplashConfigSourceLabel}</span>
             </div>
             <div className="wallpaper-storage-panel__meta wallpaper-storage-panel__meta--stack">
-              {unsplashSettings?.isBuiltIn ? (
-                <p className="helper-text helper-text--success">
-                  正在使用程序内置的 Unsplash Access Key，无需额外配置。
-                </p>
-              ) : null}
               {unsplashSettings?.hasStoredKey ? (
                 <p className="helper-text">
                   已保存应用内 Key：{unsplashSettings.maskedStoredKey || "已保存"}
-                </p>
-              ) : unsplashSettings?.isBuiltIn ? (
-                <p className="helper-text">
-                  内置 Key（{unsplashSettings.maskedStoredKey || "已配置"}）。
-                  你可以保存自己的 Key 来覆盖内置 Key。
                 </p>
               ) : (
                 <p className="helper-text">当前没有保存应用内 Key。</p>
@@ -2294,9 +2503,7 @@ function App() {
                   !unsplashSettings?.hasStoredKey
                 }
               >
-                {unsplashSettings?.hasStoredKey
-                  ? "清除已保存 Key"
-                  : "清除内置 Key"}
+                清除已保存 Key
               </button>
             </div>
             <div className="wallpaper-storage-panel__meta wallpaper-storage-panel__meta--stack">
@@ -2788,7 +2995,9 @@ function App() {
                 <div className="hero__panel">
                   <div className="hero__orb" />
                   <div className="hero__panel-inner">
-                    <p className="hero__panel-title">护眼模式已开启</p>
+                    <p className="hero__panel-title">
+                      护眼模式{filterEnabled ? "已开启" : "已关闭"}
+                    </p>
                     <p className="hero__panel-desc">
                       当前为 <strong>{activePreset}</strong> 预设，过滤强度{" "}
                       <strong>{filterStrength}%</strong>。
@@ -2815,7 +3024,11 @@ function App() {
                       <input
                         type="checkbox"
                         checked={filterEnabled}
-                        onChange={() => setFilterEnabled((prev) => !prev)}
+                        onChange={() => {
+                          filterAutoDisablePendingRef.current = false;
+                          setFilterStatusMessage(null);
+                          setFilterEnabled((previous) => !previous);
+                        }}
                       />
                       <span className="toggle__track" />
                     </label>
@@ -2874,6 +3087,11 @@ function App() {
                       onChange={(event) => setColorTemp(Number(event.target.value))}
                     />
                   </div>
+                  {filterStatusMessage ? (
+                    <p className="helper-text helper-text--error">
+                      {filterStatusMessage}
+                    </p>
+                  ) : null}
                 </div>
 
                 <div className="card">
@@ -2902,7 +3120,7 @@ function App() {
                         max={120}
                         value={restMinutes}
                         onChange={(event) =>
-                          setRestMinutes(Number(event.target.value))
+                          setRestMinutes(Math.max(1, Number(event.target.value) || 1))
                         }
                       />
                       <span>分钟</span>
@@ -2916,7 +3134,7 @@ function App() {
                         max={300}
                         value={restDuration}
                         onChange={(event) =>
-                          setRestDuration(Number(event.target.value))
+                          setRestDuration(Math.max(1, Number(event.target.value) || 1))
                         }
                       />
                       <span>秒</span>
@@ -2935,6 +3153,11 @@ function App() {
                   >
                     立即进入休息
                   </button>
+                  {settingsError ? (
+                    <p className="helper-text helper-text--error">
+                      设置保存或休息调度失败：{settingsError}
+                    </p>
+                  ) : null}
                 </div>
 
                 <div className="card">
@@ -2961,11 +3184,21 @@ function App() {
                     <label className="setting-row">
                       <span>开机自启</span>
                       <label className="toggle">
-                        <input type="checkbox" />
+                        <input
+                          type="checkbox"
+                          checked={autostartEnabled}
+                          disabled={!autostartReady || autostartPending}
+                          onChange={() => void handleAutostartChange()}
+                        />
                         <span className="toggle__track" />
                       </label>
                     </label>
                   </div>
+                  {autostartError ? (
+                    <p className="helper-text helper-text--error">
+                      开机自启设置失败：{autostartError}
+                    </p>
+                  ) : null}
                 </div>
               </section>
 
@@ -3041,7 +3274,7 @@ function App() {
                 </div>
                 <p className="lockscreen__timer-hint">
                   {lockPayload.restPaused
-                    ? "计时已暂停，点击继续恢复倒计时"
+                    ? "计时已暂停，选择“继续倒计时”即可恢复"
                     : "闭眼 20 秒，眺望远处 20 秒"}
                 </p>
               </div>
@@ -3050,11 +3283,31 @@ function App() {
               </p>
             </div>
             <div className="lockscreen__actions">
+              <div className="lockscreen__buttons">
+                <button
+                  className="btn btn--ghost"
+                  type="button"
+                  aria-pressed={lockPayload.restPaused}
+                  disabled={lockPausePending}
+                  onClick={() => void handleToggleRestPause()}
+                >
+                  {lockPausePending
+                    ? "正在更新…"
+                    : lockPayload.restPaused
+                      ? "继续倒计时"
+                      : "暂停倒计时"}
+                </button>
+              </div>
               {lockPayload.allowEscExit ? (
                 <span className="helper-text">ESC 退出已开启</span>
               ) : (
                 <span className="helper-text">ESC 已禁用</span>
               )}
+              {lockPauseError ? (
+                <span className="helper-text helper-text--error" role="alert">
+                  暂停状态更新失败：{lockPauseError}
+                </span>
+              ) : null}
             </div>
           </div>
         </div>

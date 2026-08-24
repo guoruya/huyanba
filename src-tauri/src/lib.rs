@@ -1,4 +1,8 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+mod platform;
+mod scheduler;
+mod settings;
+
 use rand::seq::SliceRandom;
 use reqwest::{
     blocking::Client,
@@ -9,16 +13,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{hash_map::DefaultHasher, HashSet};
 use std::env;
+use std::fmt;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{Cursor, Write};
-#[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32, Ordering},
-    Mutex, OnceLock,
+    atomic::{AtomicBool, Ordering},
+    mpsc::RecvTimeoutError,
+    Arc, Mutex,
 };
 use std::time::Instant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -26,15 +29,29 @@ use tauri::{
     menu::MenuBuilder,
     path::BaseDirectory,
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent,
+    AppHandle, Emitter, Manager, WebviewUrl, WindowEvent,
 };
-use windows::Win32::Foundation::HWND;
-use windows::Win32::Graphics::Gdi::{GetDC, ReleaseDC};
-use windows::Win32::UI::ColorSystem::SetDeviceGammaRamp;
+
+use platform::display_filter::{DisplayFilterStatus, FilterConfig};
+use scheduler::{
+    RestFinishedReason, RestScheduler, SchedulerConfig, SchedulerEvent, SchedulerPhase,
+    SchedulerState, StateChangeReason,
+};
+use settings::{AppSettings, SettingsStore};
+
+type MonitorSignature = Vec<(i32, i32, u32, u32, u64)>;
+static SETTINGS_UPDATE_LOCK: Mutex<()> = Mutex::new(());
+
+#[derive(Default)]
+struct LockWindowsState {
+    labels: Vec<String>,
+    monitor_signature: Option<MonitorSignature>,
+}
 
 #[derive(Default)]
 struct LockState {
-    labels: Mutex<Vec<String>>,
+    operation: Mutex<()>,
+    windows: Mutex<LockWindowsState>,
     last_update: Mutex<Option<LockUpdate>>,
 }
 
@@ -83,10 +100,34 @@ struct AppState {
     wallpaper_lock: Mutex<()>,
     palace_refresh_status: Mutex<PalaceStagingRefreshStatus>,
     cancel_refresh: AtomicBool,
-    batch_in_progress: AtomicBool,
+    batch_in_progress: Arc<AtomicBool>,
 }
 
+struct BatchInProgressGuard {
+    flag: Arc<AtomicBool>,
+}
+
+impl BatchInProgressGuard {
+    fn try_acquire(flag: &Arc<AtomicBool>) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| Self {
+                flag: Arc::clone(flag),
+            })
+    }
+}
+
+impl Drop for BatchInProgressGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
 const TRAY_ICON: tauri::image::Image<'static> = tauri::include_image!("icons/32x32.png");
+#[cfg(target_os = "macos")]
+const MACOS_TRAY_ICON: tauri::image::Image<'static> =
+    tauri::include_image!("icons/tray-template.png");
 const WALLPAPER_CACHE_LIMIT: usize = 30;
 const WALLPAPER_BATCH_SIZE: usize = 10;
 const WALLPAPER_MANUAL_REFRESH_SIZE: usize = 4;
@@ -97,7 +138,6 @@ const WALLPAPER_MIN_INTERVAL_SECS: i64 = 1;
 const WALLPAPER_MIN_WIDTH: u32 = 1920;
 const PALACE_BATCH_TOTAL_TIMEOUT_SECS: u64 = 120;
 const MAX_FALLBACK_CHAIN_DEPTH: u32 = 3;
-const DEFAULT_UNSPLASH_ACCESS_KEY: &str = "6cg78olt-4hzm2S2MThHOqrOx8H0Ut-GYhqJ3gcnt54";
 const PALACE_LIST_PAGE_SIZE: usize = 24;
 const PALACE_STAGING_DIR_NAME: &str = "palace-staging";
 const PALACE_STAGING_TEMP_DIR_NAME: &str = "palace-staging-next";
@@ -107,43 +147,18 @@ const UNSPLASH_API_BASE: &str = "https://api.unsplash.com";
 const UNSPLASH_TOPIC_SLUG: &str = "wallpapers";
 const UNSPLASH_DOWNLOAD_WIDTH: u32 = 2560;
 const UNSPLASH_DOWNLOAD_QUALITY: u32 = 80;
-const PALACE_REFERER: &str = "https://www.dpm.org.cn/lights/royal.html";
 const PALACE_LIST_ENDPOINT: &str = "https://www.dpm.org.cn/searchs/royalb.html";
-const PALACE_ACCEPT_HEADER: &str =
-    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
-const PALACE_ACCEPT_LANGUAGE_HEADER: &str = "zh-CN,zh;q=0.9,en;q=0.8";
-const PALACE_USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36";
-#[cfg(target_os = "windows")]
-const CREATE_NO_WINDOW_FLAG: u32 = 0x08000000;
-
-#[cfg(target_os = "windows")]
-fn palace_silent_command(program: &str) -> Command {
-    let mut command = Command::new(program);
-    command.creation_flags(CREATE_NO_WINDOW_FLAG);
-    command
-}
-
-#[cfg(not(target_os = "windows"))]
-fn palace_silent_command(program: &str) -> Command {
-    Command::new(program)
-}
 
 fn default_source_kind() -> String {
     "legacy".into()
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum WallpaperRemoteSource {
+    #[default]
     Unsplash,
     Palace,
-}
-
-impl Default for WallpaperRemoteSource {
-    fn default() -> Self {
-        Self::Unsplash
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,7 +240,6 @@ enum UnsplashConfigSource {
     AppConfig,
     EnvLocal,
     Env,
-    BuiltIn,
     None,
 }
 
@@ -236,7 +250,7 @@ struct UnsplashSettings {
     config_source: UnsplashConfigSource,
     has_stored_key: bool,
     masked_stored_key: Option<String>,
-    is_built_in: bool,
+    palace_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -245,7 +259,6 @@ struct ResolvedUnsplashAccessKey {
     source: UnsplashConfigSource,
     has_stored_key: bool,
     masked_stored_key: Option<String>,
-    is_built_in: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -497,123 +510,97 @@ fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
 }
 
-fn clamp(value: f64, min: f64, max: f64) -> f64 {
-    if value < min {
-        min
-    } else if value > max {
-        max
-    } else {
-        value
-    }
-}
-
-fn temperature_to_rgb(temp: f64) -> (f64, f64, f64) {
-    let temp = clamp(temp, 1000.0, 40000.0) / 100.0;
-    let (mut r, mut g, mut b);
-    if temp <= 66.0 {
-        r = 255.0;
-        g = 99.4708025861 * temp.ln() - 161.1195681661;
-        b = if temp <= 19.0 {
-            0.0
-        } else {
-            138.5177312231 * (temp - 10.0).ln() - 305.0447927307
-        };
-    } else {
-        r = 329.698727446 * (temp - 60.0).powf(-0.1332047592);
-        g = 288.1221695283 * (temp - 60.0).powf(-0.0755148492);
-        b = 255.0;
-    }
-
-    r = clamp(r, 0.0, 255.0);
-    g = clamp(g, 0.0, 255.0);
-    b = clamp(b, 0.0, 255.0);
-    (r / 255.0, g / 255.0, b / 255.0)
-}
-
-fn apply_gamma(mult_r: f64, mult_g: f64, mult_b: f64) -> Result<(), String> {
-    unsafe {
-        let hdc = GetDC(HWND(0));
-        if hdc.0 == 0 {
-            return Err("无法获取显示设备句柄".into());
-        }
-
-        let mut ramp = [0u16; 256 * 3];
-        for i in 0..256 {
-            let base = i as f64 / 255.0;
-            ramp[i] = clamp(base * 65535.0 * mult_r, 0.0, 65535.0).round() as u16;
-            ramp[i + 256] = clamp(base * 65535.0 * mult_g, 0.0, 65535.0).round() as u16;
-            ramp[i + 512] = clamp(base * 65535.0 * mult_b, 0.0, 65535.0).round() as u16;
-        }
-
-        let ok = SetDeviceGammaRamp(hdc, ramp.as_ptr() as *const _).as_bool();
-        ReleaseDC(HWND(0), hdc);
-        if !ok {
-            return Err("设置色温失败".into());
-        }
-    }
-    Ok(())
+#[tauri::command]
+fn set_gamma(filter_enabled: bool, strength: f64, color_temp: f64) -> Result<(), String> {
+    platform::display_filter::set(filter_enabled, strength, color_temp)
 }
 
 #[tauri::command]
-fn set_gamma(filter_enabled: bool, strength: f64, color_temp: f64) -> Result<(), String> {
-    if !filter_enabled {
-        return apply_gamma(1.0, 1.0, 1.0);
-    }
-    let (r, g, b) = temperature_to_rgb(color_temp);
-    let factor = clamp(strength / 100.0, 0.0, 1.0);
-    let mut mult_r = (1.0 - factor) + factor * r;
-    let mut mult_g = (1.0 - factor) + factor * g;
-    let mut mult_b = (1.0 - factor) + factor * b;
-
-    // Greenish bias to avoid reddish tint and reduce blue light.
-    let green_boost = 0.08 * factor;
-    let red_cut = 0.18 * factor;
-    let blue_cut = 0.35 * factor;
-    mult_r = clamp(mult_r * (1.0 - red_cut), 0.0, 1.0);
-    mult_g = clamp(mult_g * (1.0 + green_boost), 0.0, 1.0);
-    mult_b = clamp(mult_b * (1.0 - blue_cut), 0.0, 1.0);
-    apply_gamma(mult_r, mult_g, mult_b)
+fn set_gamma_with_status(
+    filter_enabled: bool,
+    strength: f64,
+    color_temp: f64,
+) -> Result<DisplayFilterStatus, String> {
+    platform::apply_display_filter(FilterConfig::new(filter_enabled, strength, color_temp))
 }
 
 #[tauri::command]
 fn reset_gamma() -> Result<(), String> {
-    apply_gamma(1.0, 1.0, 1.0)
+    platform::display_filter::reset()
 }
 
 #[tauri::command]
-async fn show_lock_windows(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, LockState>,
+fn get_display_filter_status() -> Result<DisplayFilterStatus, String> {
+    platform::display_filter::status()
+}
+
+#[tauri::command]
+fn restore_display_colors(app: AppHandle) -> Result<DisplayFilterStatus, String> {
+    restore_colors_for_user(&app)
+}
+
+fn show_lock_windows_inner(
+    app: &AppHandle,
+    state: &LockState,
+    end_at_ms: i64,
+    paused: bool,
+    paused_remaining: i64,
+    allow_esc: bool,
+) -> Result<(), String> {
+    let _operation = state
+        .operation
+        .lock()
+        .map_err(|_| "锁窗操作被占用".to_string())?;
+    show_lock_windows_serialized(app, state, end_at_ms, paused, paused_remaining, allow_esc)
+}
+
+fn show_lock_windows_serialized(
+    app: &AppHandle,
+    state: &LockState,
     end_at_ms: i64,
     paused: bool,
     paused_remaining: i64,
     allow_esc: bool,
 ) -> Result<(), String> {
     let start = Instant::now();
-    let mut labels = state.labels.lock().map_err(|_| "锁状态被占用")?;
-    if !labels.is_empty() {
-        for label in labels.iter() {
-            if let Some(window) = app.get_webview_window(label) {
-                let _ = window.set_always_on_top(true);
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
+    let (tracked_labels, saved_signature) = state
+        .windows
+        .lock()
+        .map(|windows| (windows.labels.clone(), windows.monitor_signature.clone()))
+        .map_err(|_| "锁状态被占用".to_string())?;
+    let live_windows = tracked_labels
+        .iter()
+        .filter_map(|label| app.get_webview_window(label))
+        .collect::<Vec<_>>();
+    let existing_windows_complete = saved_signature.as_ref().is_some_and(|signature| {
+        signature.len() == tracked_labels.len() && signature.len() == live_windows.len()
+    });
+    if existing_windows_complete {
+        for window in live_windows {
+            let _ = window.set_always_on_top(true);
+            let _ = window.show();
+            let _ = window.set_focus();
         }
         return Ok(());
     }
 
+    {
+        let mut lock_windows = state.windows.lock().map_err(|_| "锁状态被占用")?;
+        lock_windows.labels.clear();
+        lock_windows.monitor_signature = None;
+    }
+    for label in &tracked_labels {
+        if let Some(window) = app.get_webview_window(label) {
+            let _ = window.close();
+        }
+    }
+
     let monitors = app.available_monitors().map_err(|err| err.to_string())?;
-    append_app_log(&app, &format!("锁屏创建开始 monitors={}", monitors.len()));
+    let created_monitor_signature = monitor_signature_from_monitors(&monitors);
+    append_app_log(app, &format!("锁屏创建开始 monitors={}", monitors.len()));
+    let mut created_labels: Vec<String> = Vec::with_capacity(monitors.len());
     for (index, monitor) in monitors.into_iter().enumerate() {
         let label = format!("lockscreen-{}", index);
-        let position = monitor.position();
-        let size = monitor.size();
-        let scale = monitor.scale_factor();
-        let width = (size.width as f64 / scale).ceil() + 400.0;
-        let height = (size.height as f64 / scale).ceil() + 400.0;
-        let x = (position.x as f64 / scale).floor() - 200.0;
-        let y = (position.y as f64 / scale).floor() - 200.0;
-
         let url = format!(
             "index.html?lockscreen=1&end={}&paused={}&remaining={}&allowEsc={}",
             end_at_ms,
@@ -621,28 +608,47 @@ async fn show_lock_windows(
             paused_remaining,
             if allow_esc { 1 } else { 0 }
         );
-        let window = WebviewWindowBuilder::new(&app, label.clone(), WebviewUrl::App(url.into()))
-            .decorations(false)
-            .transparent(false)
-            .resizable(false)
-            .always_on_top(true)
-            .skip_taskbar(true)
-            .position(x, y)
-            .inner_size(width, height)
-            .build()
-            .map_err(|err| err.to_string())?;
+        let window = match platform::lock_window::create_lock_window(
+            app,
+            label.clone(),
+            WebviewUrl::App(url.into()),
+            &monitor,
+        ) {
+            Ok(window) => window,
+            Err(error) => {
+                for created_label in &created_labels {
+                    if let Some(window) = app.get_webview_window(created_label) {
+                        let _ = window.close();
+                    }
+                }
+                return Err(error);
+            }
+        };
 
-        apply_default_window_icon(&app, &window);
-        let _ = window.set_fullscreen(true);
-        let _ = window.set_focus();
-        labels.push(label);
+        apply_default_window_icon(app, &window);
+        created_labels.push(label);
     }
+    let created_count = created_labels.len();
+    let mut lock_windows = match state.windows.lock() {
+        Ok(windows) => windows,
+        Err(_) => {
+            for created_label in &created_labels {
+                if let Some(window) = app.get_webview_window(created_label) {
+                    let _ = window.close();
+                }
+            }
+            return Err("锁状态被占用".to_string());
+        }
+    };
+    lock_windows.labels = created_labels;
+    lock_windows.monitor_signature = Some(created_monitor_signature);
+    drop(lock_windows);
 
     append_app_log(
-        &app,
+        app,
         &format!(
             "锁屏创建完成 labels={} elapsed_ms={}",
-            labels.len(),
+            created_count,
             start.elapsed().as_millis()
         ),
     );
@@ -650,24 +656,301 @@ async fn show_lock_windows(
 }
 
 #[tauri::command]
-fn hide_lock_windows(
-    app: tauri::AppHandle,
+async fn show_lock_windows(
+    app: AppHandle,
     state: tauri::State<'_, LockState>,
+    end_at_ms: i64,
+    paused: bool,
+    paused_remaining: i64,
+    allow_esc: bool,
 ) -> Result<(), String> {
+    show_lock_windows_inner(&app, &state, end_at_ms, paused, paused_remaining, allow_esc)
+}
+
+fn hide_lock_windows_inner(app: &AppHandle, state: &LockState) -> Result<(), String> {
+    let _operation = state
+        .operation
+        .lock()
+        .map_err(|_| "锁窗操作被占用".to_string())?;
+    hide_lock_windows_serialized(app, state)
+}
+
+fn hide_lock_windows_serialized(app: &AppHandle, state: &LockState) -> Result<(), String> {
     let start = Instant::now();
-    let mut labels = state.labels.lock().map_err(|_| "锁状态被占用")?;
-    append_app_log(&app, &format!("锁屏关闭开始 labels={}", labels.len()));
-    for label in labels.iter() {
+    let labels = {
+        let mut lock_windows = state.windows.lock().map_err(|_| "锁状态被占用")?;
+        lock_windows.monitor_signature = None;
+        std::mem::take(&mut lock_windows.labels)
+    };
+    append_app_log(app, &format!("锁屏关闭开始 labels={}", labels.len()));
+    for label in &labels {
         if let Some(window) = app.get_webview_window(label) {
             let _ = window.close();
         }
     }
-    labels.clear();
     append_app_log(
-        &app,
+        app,
         &format!("锁屏关闭完成 elapsed_ms={}", start.elapsed().as_millis()),
     );
     Ok(())
+}
+
+#[tauri::command]
+fn hide_lock_windows(app: AppHandle, state: tauri::State<'_, LockState>) -> Result<(), String> {
+    hide_lock_windows_inner(&app, &state)
+}
+
+fn scheduler_lock_args(state: &SchedulerState) -> (i64, bool, i64, bool) {
+    let end_at_ms = state
+        .rest_end_at_ms
+        .unwrap_or_default()
+        .min(i64::MAX as u64) as i64;
+    let paused_remaining = state
+        .paused_remaining_ms
+        .unwrap_or_default()
+        .saturating_add(999)
+        / 1_000;
+    (
+        end_at_ms,
+        state.paused,
+        paused_remaining.min(i64::MAX as u64) as i64,
+        state.config.allow_esc,
+    )
+}
+
+fn sync_lock_windows_to_scheduler(app: &AppHandle, state: &SchedulerState) -> Result<(), String> {
+    let lock_state = app
+        .try_state::<LockState>()
+        .ok_or_else(|| "锁屏状态尚未初始化".to_string())?;
+    if state.phase == SchedulerPhase::Resting {
+        let (end_at_ms, paused, paused_remaining, allow_esc) = scheduler_lock_args(state);
+        show_lock_windows_inner(
+            app,
+            &lock_state,
+            end_at_ms,
+            paused,
+            paused_remaining,
+            allow_esc,
+        )
+    } else {
+        hide_lock_windows_inner(app, &lock_state)
+    }
+}
+
+fn rebuild_lock_windows(app: &AppHandle, state: &SchedulerState) -> Result<(), String> {
+    let lock_state = app
+        .try_state::<LockState>()
+        .ok_or_else(|| "锁屏状态尚未初始化".to_string())?;
+    let _operation = lock_state
+        .operation
+        .lock()
+        .map_err(|_| "锁窗操作被占用".to_string())?;
+    hide_lock_windows_serialized(app, &lock_state)?;
+    if state.phase == SchedulerPhase::Resting {
+        let (end_at_ms, paused, paused_remaining, allow_esc) = scheduler_lock_args(state);
+        show_lock_windows_serialized(
+            app,
+            &lock_state,
+            end_at_ms,
+            paused,
+            paused_remaining,
+            allow_esc,
+        )?;
+    }
+    Ok(())
+}
+
+fn dispatch_scheduler_event(app: &AppHandle, event: SchedulerEvent) {
+    let _ = app.emit("rest-scheduler-event", event.clone());
+    let should_reapply_filter = matches!(
+        &event,
+        SchedulerEvent::RestFinished {
+            reason: RestFinishedReason::Sleep,
+            ..
+        } | SchedulerEvent::StateChanged {
+            reason: StateChangeReason::Wake,
+            ..
+        }
+    );
+    if should_reapply_filter {
+        match platform::reapply_display_filter() {
+            Ok(status) => {
+                let _ = app.emit("display-filter-status", status);
+            }
+            Err(error) => {
+                append_app_log(app, &format!("唤醒后重放显示滤镜失败: {error}"));
+                let _ = app.emit("display-filter-error", error);
+            }
+        }
+    }
+
+    if !matches!(
+        &event,
+        SchedulerEvent::RestStarted { .. } | SchedulerEvent::RestFinished { .. }
+    ) {
+        return;
+    }
+
+    let state = event.state().clone();
+    let is_starting_rest = state.phase == SchedulerPhase::Resting;
+    let dispatcher = app.clone();
+    let callback_app = dispatcher.clone();
+    if let Err(error) = dispatcher.run_on_main_thread(move || {
+        if let Err(error) = sync_lock_windows_to_scheduler(&callback_app, &state) {
+            append_app_log(&callback_app, &format!("同步休息窗口失败: {error}"));
+            let _ = callback_app.emit("rest-scheduler-error", error.clone());
+            if state.phase == SchedulerPhase::Resting {
+                if let Some(scheduler) = callback_app.try_state::<RestScheduler>() {
+                    let _ = scheduler.finish();
+                }
+            }
+        }
+    }) {
+        append_app_log(app, &format!("提交休息窗口主线程任务失败: {error}"));
+        if is_starting_rest {
+            if let Some(scheduler) = app.try_state::<RestScheduler>() {
+                let _ = scheduler.finish();
+            }
+        }
+    }
+}
+
+fn monitor_signature_from_monitors(monitors: &[tauri::Monitor]) -> MonitorSignature {
+    let mut signature = monitors
+        .iter()
+        .map(|monitor| {
+            let position = monitor.position();
+            let size = monitor.size();
+            (
+                position.x,
+                position.y,
+                size.width,
+                size.height,
+                monitor.scale_factor().to_bits(),
+            )
+        })
+        .collect::<Vec<_>>();
+    signature.sort_unstable();
+    signature
+}
+
+fn monitor_signature(app: &AppHandle) -> Result<MonitorSignature, String> {
+    app.available_monitors()
+        .map(|monitors| monitor_signature_from_monitors(&monitors))
+        .map_err(|error| error.to_string())
+}
+
+fn lock_windows_need_rebuild(
+    created_signature: Option<&MonitorSignature>,
+    current_signature: &MonitorSignature,
+    tracked_label_count: usize,
+    live_window_count: usize,
+) -> bool {
+    created_signature.is_some_and(|created| {
+        created != current_signature
+            || tracked_label_count != created.len()
+            || live_window_count != created.len()
+    })
+}
+
+fn spawn_scheduler_bridge(
+    app: AppHandle,
+    receiver: std::sync::mpsc::Receiver<SchedulerEvent>,
+) -> Result<(), String> {
+    std::thread::Builder::new()
+        .name("rest-scheduler-events".to_string())
+        .spawn(move || loop {
+            match receiver.recv_timeout(Duration::from_secs(1)) {
+                Ok(event) => dispatch_scheduler_event(&app, event),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+
+            if platform::power_events::take_wake_requested() {
+                if let Some(scheduler) = app.try_state::<RestScheduler>() {
+                    match scheduler.reset_after_wake() {
+                        Ok(_) => append_app_log(&app, "检测到系统唤醒，已重置休息周期"),
+                        Err(error) => {
+                            let message = format!("系统唤醒后重置休息周期失败: {error}");
+                            append_app_log(&app, &message);
+                            let _ = app.emit("rest-scheduler-error", message);
+                        }
+                    }
+                }
+            }
+
+            let display_reconfigured = platform::display_filter::take_reapply_requested();
+            if display_reconfigured {
+                match platform::reapply_display_filter() {
+                    Ok(status) => {
+                        let _ = app.emit("display-filter-status", status);
+                    }
+                    Err(error) => {
+                        append_app_log(&app, &format!("显示器变更后重放滤镜失败: {error}"));
+                        let _ = app.emit("display-filter-error", error);
+                    }
+                }
+            }
+
+            let Some(scheduler) = app.try_state::<RestScheduler>() else {
+                continue;
+            };
+            let Ok(state) = scheduler.query() else {
+                break;
+            };
+            if state.phase != SchedulerPhase::Resting {
+                continue;
+            }
+            let Ok(signature) = monitor_signature(&app) else {
+                continue;
+            };
+            let lock_window_snapshot = app.try_state::<LockState>().and_then(|lock_state| {
+                lock_state
+                    .windows
+                    .lock()
+                    .ok()
+                    .map(|windows| (windows.monitor_signature.clone(), windows.labels.clone()))
+            });
+            let Some((created_signature, tracked_labels)) = lock_window_snapshot else {
+                continue;
+            };
+            let live_window_count = tracked_labels
+                .iter()
+                .filter(|label| app.get_webview_window(label).is_some())
+                .count();
+            let lock_windows_changed = lock_windows_need_rebuild(
+                created_signature.as_ref(),
+                &signature,
+                tracked_labels.len(),
+                live_window_count,
+            );
+            if !lock_windows_changed && !display_reconfigured {
+                continue;
+            }
+
+            let dispatcher = app.clone();
+            let callback_app = dispatcher.clone();
+            let state = state.clone();
+            if let Err(error) = dispatcher.run_on_main_thread(move || {
+                if let Err(error) = rebuild_lock_windows(&callback_app, &state) {
+                    append_app_log(
+                        &callback_app,
+                        &format!("显示器变更后重建休息窗口失败: {error}"),
+                    );
+                    let _ = callback_app.emit("rest-scheduler-error", error);
+                    if let Some(scheduler) = callback_app.try_state::<RestScheduler>() {
+                        let _ = scheduler.finish();
+                    }
+                }
+            }) {
+                append_app_log(&app, &format!("提交休息窗口重建任务失败: {error}"));
+                if let Some(scheduler) = app.try_state::<RestScheduler>() {
+                    let _ = scheduler.finish();
+                }
+            }
+        })
+        .map(|_| ())
+        .map_err(|error| format!("无法启动休息调度事件桥: {error}"))
 }
 
 #[tauri::command]
@@ -693,12 +976,223 @@ fn get_lock_update(state: tauri::State<'_, LockState>) -> Option<LockUpdate> {
 }
 
 #[tauri::command]
-fn lockscreen_action(app: tauri::AppHandle, action: String) -> Result<(), String> {
+fn lockscreen_action(
+    app: AppHandle,
+    scheduler: tauri::State<'_, RestScheduler>,
+    action: String,
+) -> Result<(), String> {
     append_app_log(&app, &format!("锁屏动作: {}", action));
+    match action.as_str() {
+        "exit" => {
+            scheduler.finish().map_err(|error| error.to_string())?;
+        }
+        "toggle_pause" => {
+            let current = scheduler.query().map_err(|error| error.to_string())?;
+            if current.phase == SchedulerPhase::Resting {
+                if current.paused {
+                    scheduler.resume().map_err(|error| error.to_string())?;
+                } else {
+                    scheduler.pause().map_err(|error| error.to_string())?;
+                }
+            }
+        }
+        _ => return Err(format!("未知锁屏动作: {action}")),
+    }
     for (_label, window) in app.webview_windows() {
         let _ = window.emit("lockscreen-action", action.clone());
     }
     Ok(())
+}
+
+#[tauri::command]
+fn get_app_settings(store: tauri::State<'_, SettingsStore>) -> Result<AppSettings, String> {
+    store.load().map_err(|error| error.to_string())
+}
+
+trait SettingsUpdateBackend {
+    fn load_settings(&mut self) -> Result<AppSettings, String>;
+    fn save_settings(&mut self, settings: &AppSettings) -> Result<(), String>;
+    fn configure_scheduler(&mut self, config: SchedulerConfig) -> Result<(), String>;
+    fn query_scheduler_config(&mut self) -> Result<SchedulerConfig, String>;
+}
+
+struct LiveSettingsUpdateBackend<'a> {
+    store: &'a SettingsStore,
+    scheduler: &'a RestScheduler,
+}
+
+impl SettingsUpdateBackend for LiveSettingsUpdateBackend<'_> {
+    fn load_settings(&mut self) -> Result<AppSettings, String> {
+        self.store.load().map_err(|error| error.to_string())
+    }
+
+    fn save_settings(&mut self, settings: &AppSettings) -> Result<(), String> {
+        self.store.save(settings).map_err(|error| error.to_string())
+    }
+
+    fn configure_scheduler(&mut self, config: SchedulerConfig) -> Result<(), String> {
+        self.scheduler
+            .configure(config)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn query_scheduler_config(&mut self) -> Result<SchedulerConfig, String> {
+        self.scheduler
+            .query()
+            .map(|state| state.config)
+            .map_err(|error| error.to_string())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SettingsUpdateFailure {
+    primary: String,
+    rollback_target: &'static str,
+    rollback_failures: Vec<String>,
+}
+
+impl fmt::Display for SettingsUpdateFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.primary)?;
+        if self.rollback_failures.is_empty() {
+            write!(
+                formatter,
+                "；已验证{}恢复到更新前状态",
+                self.rollback_target
+            )
+        } else {
+            write!(
+                formatter,
+                "；{}回滚未完全成功：{}",
+                self.rollback_target,
+                self.rollback_failures.join("；")
+            )
+        }
+    }
+}
+
+fn rollback_persisted_settings(
+    backend: &mut impl SettingsUpdateBackend,
+    previous: &AppSettings,
+    failures: &mut Vec<String>,
+) {
+    if let Err(error) = backend.save_settings(previous) {
+        failures.push(format!("恢复设置文件写入失败: {error}"));
+    }
+    match backend.load_settings() {
+        Ok(current) if current == *previous => {}
+        Ok(_) => failures.push("恢复设置文件后读取验证不一致".to_string()),
+        Err(error) => failures.push(format!("恢复设置文件后读取验证失败: {error}")),
+    }
+}
+
+fn rollback_scheduler_config(
+    backend: &mut impl SettingsUpdateBackend,
+    previous: SchedulerConfig,
+    failures: &mut Vec<String>,
+) {
+    if let Err(error) = backend.configure_scheduler(previous) {
+        failures.push(format!("恢复休息调度配置失败: {error}"));
+    }
+    match backend.query_scheduler_config() {
+        Ok(current) if current == previous => {}
+        Ok(_) => failures.push("恢复休息调度配置后查询验证不一致".to_string()),
+        Err(error) => failures.push(format!("恢复休息调度配置后查询验证失败: {error}")),
+    }
+}
+
+fn update_app_settings_with_backend(
+    backend: &mut impl SettingsUpdateBackend,
+    settings: &AppSettings,
+) -> Result<(), String> {
+    settings.validate().map_err(|error| error.to_string())?;
+    let previous = backend
+        .load_settings()
+        .map_err(|error| format!("读取更新前设置失败: {error}"))?;
+
+    if let Err(error) = backend.save_settings(settings) {
+        let mut rollback_failures = Vec::new();
+        rollback_persisted_settings(backend, &previous, &mut rollback_failures);
+        return Err(SettingsUpdateFailure {
+            primary: format!("保存应用设置失败: {error}"),
+            rollback_target: "设置文件",
+            rollback_failures,
+        }
+        .to_string());
+    }
+
+    if let Err(error) = backend.configure_scheduler(SchedulerConfig::from(settings)) {
+        let mut rollback_failures = Vec::new();
+        rollback_persisted_settings(backend, &previous, &mut rollback_failures);
+        rollback_scheduler_config(
+            backend,
+            SchedulerConfig::from(&previous),
+            &mut rollback_failures,
+        );
+        return Err(SettingsUpdateFailure {
+            primary: format!("更新休息调度失败: {error}"),
+            rollback_target: "设置文件和休息调度配置",
+            rollback_failures,
+        }
+        .to_string());
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn update_app_settings(
+    settings: AppSettings,
+    store: tauri::State<'_, SettingsStore>,
+    scheduler: tauri::State<'_, RestScheduler>,
+) -> Result<AppSettings, String> {
+    let _guard = SETTINGS_UPDATE_LOCK
+        .lock()
+        .map_err(|_| "设置更新串行锁已损坏".to_string())?;
+    let mut backend = LiveSettingsUpdateBackend {
+        store: store.inner(),
+        scheduler: scheduler.inner(),
+    };
+    update_app_settings_with_backend(&mut backend, &settings)?;
+    Ok(settings)
+}
+
+#[tauri::command]
+fn get_scheduler_state(
+    scheduler: tauri::State<'_, RestScheduler>,
+) -> Result<SchedulerState, String> {
+    scheduler.query().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn start_rest_now(scheduler: tauri::State<'_, RestScheduler>) -> Result<SchedulerState, String> {
+    scheduler.start_now().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn finish_rest(scheduler: tauri::State<'_, RestScheduler>) -> Result<SchedulerState, String> {
+    scheduler.finish().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn toggle_rest_pause(scheduler: tauri::State<'_, RestScheduler>) -> Result<SchedulerState, String> {
+    let current = scheduler.query().map_err(|error| error.to_string())?;
+    if current.phase != SchedulerPhase::Resting {
+        return Ok(current);
+    }
+    if current.paused {
+        scheduler.resume().map_err(|error| error.to_string())
+    } else {
+        scheduler.pause().map_err(|error| error.to_string())
+    }
+}
+
+#[tauri::command]
+fn restart_rest_cycle(
+    scheduler: tauri::State<'_, RestScheduler>,
+) -> Result<SchedulerState, String> {
+    scheduler.restart_cycle().map_err(|error| error.to_string())
 }
 
 fn now_ts() -> i64 {
@@ -884,7 +1378,6 @@ fn resolve_unsplash_access_key(app: &AppHandle) -> ResolvedUnsplashAccessKey {
             source: UnsplashConfigSource::AppConfig,
             has_stored_key,
             masked_stored_key,
-            is_built_in: false,
         };
     }
 
@@ -894,7 +1387,6 @@ fn resolve_unsplash_access_key(app: &AppHandle) -> ResolvedUnsplashAccessKey {
             source: UnsplashConfigSource::EnvLocal,
             has_stored_key,
             masked_stored_key,
-            is_built_in: false,
         };
     }
 
@@ -906,21 +1398,8 @@ fn resolve_unsplash_access_key(app: &AppHandle) -> ResolvedUnsplashAccessKey {
                 source: UnsplashConfigSource::Env,
                 has_stored_key,
                 masked_stored_key,
-                is_built_in: false,
             };
         }
-    }
-
-    // 内置 key 作为最终回退，保证每个副本都可用
-    let built_in_key = DEFAULT_UNSPLASH_ACCESS_KEY.trim();
-    if !built_in_key.is_empty() {
-        return ResolvedUnsplashAccessKey {
-            access_key: Some(built_in_key.to_string()),
-            source: UnsplashConfigSource::BuiltIn,
-            has_stored_key,
-            masked_stored_key: mask_access_key(built_in_key),
-            is_built_in: true,
-        };
     }
 
     ResolvedUnsplashAccessKey {
@@ -928,7 +1407,6 @@ fn resolve_unsplash_access_key(app: &AppHandle) -> ResolvedUnsplashAccessKey {
         source: UnsplashConfigSource::None,
         has_stored_key,
         masked_stored_key,
-        is_built_in: false,
     }
 }
 
@@ -938,7 +1416,7 @@ fn unsplash_settings_from_resolved(resolved: ResolvedUnsplashAccessKey) -> Unspl
         config_source: resolved.source,
         has_stored_key: resolved.has_stored_key,
         masked_stored_key: resolved.masked_stored_key,
-        is_built_in: resolved.is_built_in,
+        palace_enabled: palace_wallpaper_source_enabled(),
     }
 }
 
@@ -1456,12 +1934,36 @@ fn remote_source_label(source: WallpaperRemoteSource) -> &'static str {
     }
 }
 
-fn resolve_online_source(app: &AppHandle) -> WallpaperRemoteSource {
-    if resolve_unsplash_access_key(app).access_key.is_some() {
+const PALACE_WALLPAPER_DISABLED_MESSAGE: &str = "macOS 暂未启用故宫壁纸来源，请使用 Unsplash。";
+
+const fn palace_wallpaper_source_enabled() -> bool {
+    !cfg!(target_os = "macos")
+}
+
+fn ensure_palace_wallpaper_source_enabled() -> Result<(), String> {
+    if palace_wallpaper_source_enabled() {
+        Ok(())
+    } else {
+        Err(PALACE_WALLPAPER_DISABLED_MESSAGE.into())
+    }
+}
+
+fn choose_online_source(
+    has_unsplash_access_key: bool,
+    palace_enabled: bool,
+) -> WallpaperRemoteSource {
+    if has_unsplash_access_key || !palace_enabled {
         WallpaperRemoteSource::Unsplash
     } else {
         WallpaperRemoteSource::Palace
     }
+}
+
+fn resolve_online_source(app: &AppHandle) -> WallpaperRemoteSource {
+    choose_online_source(
+        resolve_unsplash_access_key(app).access_key.is_some(),
+        palace_wallpaper_source_enabled(),
+    )
 }
 
 fn canonical_unsplash_source_url(photo_url: &str, remote_id: &str) -> String {
@@ -1795,7 +2297,58 @@ fn read_local_env_value(key: &str) -> Option<String> {
     None
 }
 
-fn build_unsplash_api_client(access_key: &str, disable_proxy: bool) -> Result<Client, String> {
+#[derive(Debug)]
+enum HttpFetchError {
+    Transport(reqwest::Error),
+    HttpStatus {
+        status: reqwest::StatusCode,
+        message: String,
+    },
+    Terminal(String),
+}
+
+impl HttpFetchError {
+    fn http_status(status: reqwest::StatusCode, message: impl Into<String>) -> Self {
+        Self::HttpStatus {
+            status,
+            message: message.into(),
+        }
+    }
+
+    fn terminal(message: impl Into<String>) -> Self {
+        Self::Terminal(message.into())
+    }
+}
+
+impl fmt::Display for HttpFetchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transport(error) => error.fmt(formatter),
+            Self::HttpStatus { message, .. } | Self::Terminal(message) => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
+
+fn should_retry_without_proxy(error: &HttpFetchError) -> bool {
+    match error {
+        HttpFetchError::Transport(error) => {
+            error.status().is_none() && !error.is_decode() && !error.is_builder()
+        }
+        HttpFetchError::HttpStatus { status, .. } => {
+            debug_assert!(!status.is_success());
+            *status == reqwest::StatusCode::PROXY_AUTHENTICATION_REQUIRED
+                || status.is_server_error()
+        }
+        HttpFetchError::Terminal(_) => false,
+    }
+}
+
+fn build_unsplash_api_client(
+    access_key: &str,
+    disable_proxy: bool,
+) -> Result<Client, HttpFetchError> {
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
     headers.insert(
@@ -1804,13 +2357,11 @@ fn build_unsplash_api_client(access_key: &str, disable_proxy: bool) -> Result<Cl
     );
     headers.insert(
         USER_AGENT,
-        HeaderValue::from_static(
-            "huyanba/0.4.0 (desktop wallpaper prototype; https://github.com/guoruya/huyanba)",
-        ),
+        HeaderValue::from_static("Huyanba/2.4.0 (desktop; https://github.com/guoruya/huyanba)"),
     );
     headers.insert("Accept-Version", HeaderValue::from_static("v1"));
     let auth = HeaderValue::from_str(&format!("Client-ID {}", access_key))
-        .map_err(|err| err.to_string())?;
+        .map_err(|error| HttpFetchError::terminal(error.to_string()))?;
     headers.insert(AUTHORIZATION, auth);
 
     let mut builder = Client::builder()
@@ -1822,18 +2373,27 @@ fn build_unsplash_api_client(access_key: &str, disable_proxy: bool) -> Result<Cl
     if disable_proxy {
         builder = builder.no_proxy();
     }
-    builder.build().map_err(|err| err.to_string())
+    builder.build().map_err(HttpFetchError::Transport)
 }
 
-fn build_palace_client(disable_proxy: bool) -> Result<Client, String> {
+fn build_palace_client(disable_proxy: bool) -> Result<Client, HttpFetchError> {
     let mut headers = HeaderMap::new();
-    headers.insert(ACCEPT, HeaderValue::from_static(PALACE_ACCEPT_HEADER));
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static(platform::download_transport::PALACE_ACCEPT),
+    );
     headers.insert(
         ACCEPT_LANGUAGE,
-        HeaderValue::from_static(PALACE_ACCEPT_LANGUAGE_HEADER),
+        HeaderValue::from_static(platform::download_transport::PALACE_ACCEPT_LANGUAGE),
     );
-    headers.insert(USER_AGENT, HeaderValue::from_static(PALACE_USER_AGENT));
-    headers.insert(REFERER, HeaderValue::from_static(PALACE_REFERER));
+    headers.insert(
+        USER_AGENT,
+        HeaderValue::from_static(platform::download_transport::DESKTOP_USER_AGENT),
+    );
+    headers.insert(
+        REFERER,
+        HeaderValue::from_static(platform::download_transport::PALACE_REFERER),
+    );
     headers.insert(
         "x-requested-with",
         HeaderValue::from_static("XMLHttpRequest"),
@@ -1848,19 +2408,7 @@ fn build_palace_client(disable_proxy: bool) -> Result<Client, String> {
     if disable_proxy {
         builder = builder.no_proxy();
     }
-    builder.build().map_err(|err| err.to_string())
-}
-
-fn should_retry_without_proxy(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    message.contains("unexpected eof during handshake")
-        || message.contains("handshake")
-        || message.contains("tls")
-        || message.contains("error trying to connect")
-        || message.contains("os error -2146893018")
-        || message.contains("format of the received message was unexpected or incorrect")
-        || message.contains("接收到的消息异常")
-        || message.contains("格式不正确")
+    builder.build().map_err(HttpFetchError::Transport)
 }
 
 fn with_unsplash_client<T, F>(
@@ -1870,14 +2418,15 @@ fn with_unsplash_client<T, F>(
     mut operation: F,
 ) -> Result<T, String>
 where
-    F: FnMut(&Client) -> Result<T, String>,
+    F: FnMut(&Client) -> Result<T, HttpFetchError>,
 {
-    let client = build_unsplash_api_client(access_key, false)?;
-    match operation(&client) {
+    let first_result =
+        build_unsplash_api_client(access_key, false).and_then(|client| operation(&client));
+    match first_result {
         Ok(value) => Ok(value),
         Err(err) => {
             if !should_retry_without_proxy(&err) {
-                return Err(err);
+                return Err(err.to_string());
             }
             if let Some(app) = app {
                 append_wallpaper_log(
@@ -1888,8 +2437,9 @@ where
                     ),
                 );
             }
-            let fallback_client = build_unsplash_api_client(access_key, true)?;
-            operation(&fallback_client)
+            build_unsplash_api_client(access_key, true)
+                .and_then(|client| operation(&client))
+                .map_err(|error| error.to_string())
         }
     }
 }
@@ -1911,10 +2461,6 @@ fn log_palace_transport(
     }
 }
 
-fn escape_powershell_single_quoted(value: &str) -> String {
-    value.replace('\'', "''")
-}
-
 fn palace_temp_download_path(kind: &str, url: &str) -> PathBuf {
     env::temp_dir().join(format!(
         "huyanba_palace_{}_{}_{}.tmp",
@@ -1924,121 +2470,18 @@ fn palace_temp_download_path(kind: &str, url: &str) -> PathBuf {
     ))
 }
 
-#[cfg(target_os = "windows")]
-fn run_powershell_download(url: &str, output_path: &Path) -> Result<(), String> {
-    let script = format!(
-        r#"$ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$OutputEncoding = [System.Text.Encoding]::UTF8
-[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
-$headers = @{{
-  'Referer' = '{referer}'
-  'X-Requested-With' = 'XMLHttpRequest'
-  'User-Agent' = '{user_agent}'
-  'Accept' = '{accept}'
-  'Accept-Language' = '{accept_language}'
-}}
-Invoke-WebRequest -Uri '{url}' -Headers $headers -OutFile '{output_path}' -UseBasicParsing"#,
-        referer = escape_powershell_single_quoted(PALACE_REFERER),
-        user_agent = escape_powershell_single_quoted(PALACE_USER_AGENT),
-        accept = escape_powershell_single_quoted(PALACE_ACCEPT_HEADER),
-        accept_language = escape_powershell_single_quoted(PALACE_ACCEPT_LANGUAGE_HEADER),
-        url = escape_powershell_single_quoted(url),
-        output_path = escape_powershell_single_quoted(&output_path.to_string_lossy()),
-    );
-    let output = palace_silent_command("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output()
-        .map_err(|err| err.to_string())?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Err(if !stderr.is_empty() { stderr } else { stdout })
-}
-
-#[cfg(not(target_os = "windows"))]
-fn run_powershell_download(_url: &str, _output_path: &Path) -> Result<(), String> {
-    Err("当前平台不支持 PowerShell 回退。".into())
-}
-
-#[cfg(target_os = "windows")]
-fn run_curl_download(url: &str, output_path: &Path) -> Result<(), String> {
-    let output = palace_silent_command("curl.exe")
-        .args([
-            "-L",
-            "-sS",
-            "--fail",
-            "--compressed",
-            "--connect-timeout",
-            "15",
-            "-H",
-            &format!("Referer: {}", PALACE_REFERER),
-            "-H",
-            "X-Requested-With: XMLHttpRequest",
-            "-H",
-            &format!("User-Agent: {}", PALACE_USER_AGENT),
-            "-H",
-            &format!("Accept: {}", PALACE_ACCEPT_HEADER),
-            "-H",
-            &format!("Accept-Language: {}", PALACE_ACCEPT_LANGUAGE_HEADER),
-            "-o",
-            &output_path.to_string_lossy(),
-            url,
-        ])
-        .output()
-        .map_err(|err| err.to_string())?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Err(if !stderr.is_empty() { stderr } else { stdout })
-}
-
-#[cfg(not(target_os = "windows"))]
-fn run_curl_download(_url: &str, _output_path: &Path) -> Result<(), String> {
-    Err("当前平台不支持 curl 回退。".into())
-}
-
 fn powershell_available() -> bool {
-    static CACHED: OnceLock<Option<bool>> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::process::Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", "exit 0"])
-            .creation_flags(CREATE_NO_WINDOW_FLAG)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .map(|o| o.status.success())
-            .ok()
-    })
-    .as_ref()
-    .unwrap_or(&false)
+    platform::download_transport::powershell_available()
 }
 
 fn curl_available() -> bool {
-    static CACHED: OnceLock<Option<bool>> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::process::Command::new("curl.exe")
-            .arg("--version")
-            .creation_flags(CREATE_NO_WINDOW_FLAG)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .map(|o| o.status.success())
-            .ok()
-    })
-    .as_ref()
-    .unwrap_or(&false)
+    platform::download_transport::curl_available()
 }
 
 fn palace_fetch_text_via_powershell(url: &str) -> Result<String, String> {
     let temp_path = palace_temp_download_path("html", url);
     let result = (|| {
-        run_powershell_download(url, &temp_path)?;
+        platform::download_transport::run_powershell_download(url, &temp_path)?;
         fs::read_to_string(&temp_path).map_err(|err| err.to_string())
     })();
     let _ = fs::remove_file(&temp_path);
@@ -2048,7 +2491,7 @@ fn palace_fetch_text_via_powershell(url: &str) -> Result<String, String> {
 fn palace_fetch_text_via_curl(url: &str) -> Result<String, String> {
     let temp_path = palace_temp_download_path("curl_html", url);
     let result = (|| {
-        run_curl_download(url, &temp_path)?;
+        platform::download_transport::run_curl_download(url, &temp_path)?;
         fs::read_to_string(&temp_path).map_err(|err| err.to_string())
     })();
     let _ = fs::remove_file(&temp_path);
@@ -2058,7 +2501,7 @@ fn palace_fetch_text_via_curl(url: &str) -> Result<String, String> {
 fn palace_fetch_bytes_via_powershell(url: &str) -> Result<Vec<u8>, String> {
     let temp_path = palace_temp_download_path("bytes", url);
     let result = (|| {
-        run_powershell_download(url, &temp_path)?;
+        platform::download_transport::run_powershell_download(url, &temp_path)?;
         fs::read(&temp_path).map_err(|err| err.to_string())
     })();
     let _ = fs::remove_file(&temp_path);
@@ -2068,116 +2511,117 @@ fn palace_fetch_bytes_via_powershell(url: &str) -> Result<Vec<u8>, String> {
 fn palace_fetch_bytes_via_curl(url: &str) -> Result<Vec<u8>, String> {
     let temp_path = palace_temp_download_path("curl_bytes", url);
     let result = (|| {
-        run_curl_download(url, &temp_path)?;
+        platform::download_transport::run_curl_download(url, &temp_path)?;
         fs::read(&temp_path).map_err(|err| err.to_string())
     })();
     let _ = fs::remove_file(&temp_path);
     result
 }
 
-fn palace_fetch_text_with_client(client: &Client, url: &str) -> Result<String, String> {
-    let response = client.get(url).send().map_err(|err| err.to_string())?;
+fn palace_fetch_text_with_client(client: &Client, url: &str) -> Result<String, HttpFetchError> {
+    let response = client.get(url).send().map_err(HttpFetchError::Transport)?;
     if !response.status().is_success() {
-        return Err(palace_error_message(response.status()));
+        let status = response.status();
+        return Err(HttpFetchError::http_status(
+            status,
+            palace_error_message(status),
+        ));
     }
-    response.text().map_err(|err| err.to_string())
+    response.text().map_err(HttpFetchError::Transport)
 }
 
-fn palace_fetch_bytes_with_client(client: &Client, url: &str) -> Result<Vec<u8>, String> {
-    let response = client.get(url).send().map_err(|err| err.to_string())?;
+fn palace_fetch_bytes_with_client(client: &Client, url: &str) -> Result<Vec<u8>, HttpFetchError> {
+    let response = client.get(url).send().map_err(HttpFetchError::Transport)?;
     if !response.status().is_success() {
-        return Err(palace_error_message(response.status()));
+        let status = response.status();
+        return Err(HttpFetchError::http_status(
+            status,
+            palace_error_message(status),
+        ));
     }
     response
         .bytes()
         .map(|bytes| bytes.to_vec())
-        .map_err(|err| err.to_string())
+        .map_err(HttpFetchError::Transport)
 }
 
-static GLOBAL_FALLBACK_DEPTH: AtomicU32 = AtomicU32::new(0);
-
-fn fallback_depth_exceeded() -> bool {
-    GLOBAL_FALLBACK_DEPTH.load(Ordering::Relaxed) >= MAX_FALLBACK_CHAIN_DEPTH
-}
-
-fn enter_fallback() {
-    GLOBAL_FALLBACK_DEPTH.fetch_add(1, Ordering::SeqCst);
-}
-
-fn leave_fallback() {
-    GLOBAL_FALLBACK_DEPTH.fetch_sub(1, Ordering::SeqCst);
-}
-
-fn reset_fallback_depth() {
-    GLOBAL_FALLBACK_DEPTH.store(0, Ordering::SeqCst);
-}
-
-struct FallbackGuard;
-
-impl FallbackGuard {
-    fn new() -> Self {
-        enter_fallback();
-        FallbackGuard
-    }
-}
-
-impl Drop for FallbackGuard {
-    fn drop(&mut self) {
-        leave_fallback();
-    }
+fn advance_fallback_depth(depth: u32) -> Option<u32> {
+    depth
+        .checked_add(1)
+        .filter(|next_depth| *next_depth <= MAX_FALLBACK_CHAIN_DEPTH)
 }
 
 fn palace_fetch_with_fallback<T, F, G, H>(
     app: Option<&AppHandle>,
     context: &str,
     url: &str,
+    fallback_depth: u32,
     mut reqwest_fetch: F,
     mut powershell_fetch: G,
     mut curl_fetch: H,
 ) -> Result<T, String>
 where
-    F: FnMut(&Client, &str) -> Result<T, String>,
+    F: FnMut(&Client, &str) -> Result<T, HttpFetchError>,
     G: FnMut(&str) -> Result<T, String>,
     H: FnMut(&str) -> Result<T, String>,
 {
-    let client = build_palace_client(false)?;
-    let no_proxy_err = match reqwest_fetch(&client, url) {
+    let first_result = build_palace_client(false).and_then(|client| reqwest_fetch(&client, url));
+    let (no_proxy_err, mut fallback_depth) = match first_result {
         Ok(value) => {
             log_palace_transport(app, context, "reqwest_success", url, "ok");
             return Ok(value);
         }
         Err(first_err) => {
             if !should_retry_without_proxy(&first_err) {
-                return Err(first_err);
+                return Err(first_err.to_string());
             }
-            let fallback_client = build_palace_client(true)?;
-            match reqwest_fetch(&fallback_client, url) {
+            let no_proxy_depth = advance_fallback_depth(fallback_depth).ok_or_else(|| {
+                format!(
+                    "故宫壁纸请求失败（回退链已达上限，跳过 no_proxy/powershell/curl）: {}",
+                    first_err
+                )
+            })?;
+            let no_proxy_result =
+                build_palace_client(true).and_then(|client| reqwest_fetch(&client, url));
+            match no_proxy_result {
                 Ok(value) => {
                     log_palace_transport(app, context, "reqwest_no_proxy_retry_success", url, "ok");
                     return Ok(value);
                 }
-                Err(no_proxy_err) => no_proxy_err,
+                Err(no_proxy_err) if should_retry_without_proxy(&no_proxy_err) => {
+                    (no_proxy_err, no_proxy_depth)
+                }
+                Err(no_proxy_err) => return Err(no_proxy_err.to_string()),
             }
         }
     };
 
-    if fallback_depth_exceeded() {
-        return Err(format!(
-            "故宫壁纸请求失败（回退链已达上限，跳过 powershell/curl）: {}",
-            no_proxy_err
-        ));
-    }
-
-    let _guard = FallbackGuard::new();
-
-    if powershell_available() {
+    let powershell_available = powershell_available();
+    let mut powershell_attempted = false;
+    if powershell_available {
+        fallback_depth = advance_fallback_depth(fallback_depth).ok_or_else(|| {
+            format!(
+                "故宫壁纸请求失败（回退链已达上限，跳过 powershell/curl）: {}",
+                no_proxy_err
+            )
+        })?;
+        powershell_attempted = true;
         if let Ok(value) = powershell_fetch(url) {
             log_palace_transport(app, context, "powershell_fallback_success", url, "ok");
             return Ok(value);
         }
     }
 
-    if curl_available() {
+    let curl_available = curl_available();
+    let mut curl_attempted = false;
+    if curl_available {
+        let _curl_depth = advance_fallback_depth(fallback_depth).ok_or_else(|| {
+            format!(
+                "故宫壁纸请求失败（回退链已达上限，跳过 curl）: {}",
+                no_proxy_err
+            )
+        })?;
+        curl_attempted = true;
         if let Ok(value) = curl_fetch(url) {
             log_palace_transport(app, context, "curl_fallback_success", url, "ok");
             return Ok(value);
@@ -2187,8 +2631,16 @@ where
     Err(format!(
         "故宫壁纸请求失败: reqwest+no_proxy={}（powershell={} curl={}）",
         no_proxy_err,
-        if powershell_available() { "已尝试" } else { "不可用" },
-        if curl_available() { "已尝试" } else { "不可用" }
+        if powershell_attempted {
+            "已尝试"
+        } else {
+            "不可用"
+        },
+        if curl_attempted {
+            "已尝试"
+        } else {
+            "不可用"
+        }
     ))
 }
 
@@ -2197,6 +2649,7 @@ fn palace_fetch_text(app: Option<&AppHandle>, context: &str, url: &str) -> Resul
         app,
         context,
         url,
+        0,
         palace_fetch_text_with_client,
         palace_fetch_text_via_powershell,
         palace_fetch_text_via_curl,
@@ -2212,6 +2665,7 @@ fn palace_fetch_bytes(
         app,
         context,
         url,
+        0,
         palace_fetch_bytes_with_client,
         palace_fetch_bytes_via_powershell,
         palace_fetch_bytes_via_curl,
@@ -2330,7 +2784,7 @@ fn fetch_unsplash_search_page(
     query: &str,
     page: usize,
     per_page: usize,
-) -> Result<RemoteWallpaperSearchResult, String> {
+) -> Result<RemoteWallpaperSearchResult, HttpFetchError> {
     let page = page.max(1);
     let per_page = per_page.clamp(1, 30);
     if query.trim().is_empty() {
@@ -2338,7 +2792,7 @@ fn fetch_unsplash_search_page(
             "{}/topics/{}/photos",
             UNSPLASH_API_BASE, UNSPLASH_TOPIC_SLUG
         ))
-        .map_err(|err| err.to_string())?;
+        .map_err(|error| HttpFetchError::terminal(error.to_string()))?;
         {
             let mut pairs = url.query_pairs_mut();
             pairs.append_pair("page", &page.to_string());
@@ -2346,13 +2800,17 @@ fn fetch_unsplash_search_page(
             pairs.append_pair("orientation", "landscape");
             pairs.append_pair("order_by", "latest");
         }
-        let response = client.get(url).send().map_err(|err| err.to_string())?;
+        let response = client.get(url).send().map_err(HttpFetchError::Transport)?;
         if !response.status().is_success() {
-            return Err(unsplash_error_message(response.status()));
+            let status = response.status();
+            return Err(HttpFetchError::http_status(
+                status,
+                unsplash_error_message(status),
+            ));
         }
         let photos = response
             .json::<Vec<UnsplashApiPhoto>>()
-            .map_err(|err| err.to_string())?;
+            .map_err(HttpFetchError::Transport)?;
         let has_next_page = photos.len() >= per_page;
         return Ok(RemoteWallpaperSearchResult {
             source: WallpaperRemoteSource::Unsplash,
@@ -2368,7 +2826,7 @@ fn fetch_unsplash_search_page(
     }
 
     let mut url = Url::parse(&format!("{}/search/photos", UNSPLASH_API_BASE))
-        .map_err(|err| err.to_string())?;
+        .map_err(|error| HttpFetchError::terminal(error.to_string()))?;
     {
         let mut pairs = url.query_pairs_mut();
         pairs.append_pair("query", query.trim());
@@ -2376,13 +2834,17 @@ fn fetch_unsplash_search_page(
         pairs.append_pair("per_page", &per_page.to_string());
         pairs.append_pair("orientation", "landscape");
     }
-    let response = client.get(url).send().map_err(|err| err.to_string())?;
+    let response = client.get(url).send().map_err(HttpFetchError::Transport)?;
     if !response.status().is_success() {
-        return Err(unsplash_error_message(response.status()));
+        let status = response.status();
+        return Err(HttpFetchError::http_status(
+            status,
+            unsplash_error_message(status),
+        ));
     }
     let payload = response
         .json::<UnsplashApiSearchResponse>()
-        .map_err(|err| err.to_string())?;
+        .map_err(HttpFetchError::Transport)?;
     Ok(RemoteWallpaperSearchResult {
         source: WallpaperRemoteSource::Unsplash,
         configured: true,
@@ -2866,8 +3328,11 @@ where
                 break;
             }
             // 用户取消检查
-            let app_state = app.state::<AppState>();
-            if app_state.cancel_refresh.load(Ordering::SeqCst) {
+            if app
+                .state::<AppState>()
+                .cancel_refresh
+                .load(Ordering::SeqCst)
+            {
                 append_wallpaper_log(app, "故宫候选批次获取被用户取消");
                 let _ = set_palace_staging_refresh_status(
                     app,
@@ -2885,8 +3350,6 @@ where
                 cancelled = true;
                 break;
             }
-            drop(app_state);
-
             let processed_entries = processed_entries + 1;
             progress(
                 processed_entries,
@@ -3104,19 +3567,32 @@ fn track_unsplash_download(app: &AppHandle, client: &Client, download_location: 
     }
 }
 
+struct WallpaperDownloadMetadata<'a> {
+    source_kind: WallpaperRemoteSource,
+    remote_id: &'a str,
+    source_url: String,
+    thumb_url: &'a str,
+    author_name: &'a str,
+    author_url: &'a str,
+    photo_url: &'a str,
+}
+
 fn persist_downloaded_wallpaper(
     wall_state: &mut WallpaperState,
     dir: &Path,
     bytes: &[u8],
-    source_kind: WallpaperRemoteSource,
-    remote_id: &str,
-    source_url: String,
-    thumb_url: &str,
-    author_name: &str,
-    author_url: &str,
-    photo_url: &str,
+    metadata: WallpaperDownloadMetadata<'_>,
     set_fixed: bool,
 ) -> Result<DownloadWallpaperResult, String> {
+    let WallpaperDownloadMetadata {
+        source_kind,
+        remote_id,
+        source_url,
+        thumb_url,
+        author_name,
+        author_url,
+        photo_url,
+    } = metadata;
     if let Some(index) = find_wallpaper_index(wall_state, &source_url, remote_id) {
         {
             let entry = &mut wall_state.files[index];
@@ -3179,35 +3655,43 @@ fn download_unsplash_wallpaper_internal(
     dir: &Path,
     request: &UnsplashDownloadRequest,
     set_fixed: bool,
-) -> Result<DownloadWallpaperResult, String> {
+) -> Result<DownloadWallpaperResult, HttpFetchError> {
     let source_url = canonical_unsplash_source_url(&request.photo_url, &request.id);
     track_unsplash_download(app, client, &request.download_location);
-    let image_url = build_unsplash_download_url(&request.raw_url)?;
+    let image_url =
+        build_unsplash_download_url(&request.raw_url).map_err(HttpFetchError::terminal)?;
     let response = client
         .get(image_url)
         .send()
-        .map_err(|err| err.to_string())?;
+        .map_err(HttpFetchError::Transport)?;
     if !response.status().is_success() {
-        return Err(unsplash_error_message(response.status()));
+        let status = response.status();
+        return Err(HttpFetchError::http_status(
+            status,
+            unsplash_error_message(status),
+        ));
     }
-    let bytes = response.bytes().map_err(|err| err.to_string())?;
-    let (width, height) = inspect_image_dimensions(&bytes)?;
+    let bytes = response.bytes().map_err(HttpFetchError::Transport)?;
+    let (width, height) = inspect_image_dimensions(&bytes).map_err(HttpFetchError::terminal)?;
     if !is_valid_wallpaper_size(width, height) {
-        return Err("下载图片尺寸不满足桌面壁纸要求。".into());
+        return Err(HttpFetchError::terminal("下载图片尺寸不满足桌面壁纸要求。"));
     }
     persist_downloaded_wallpaper(
         wall_state,
         dir,
         &bytes,
-        WallpaperRemoteSource::Unsplash,
-        &request.id,
-        source_url,
-        &request.thumb_url,
-        &request.author_name,
-        &request.author_url,
-        &request.photo_url,
+        WallpaperDownloadMetadata {
+            source_kind: WallpaperRemoteSource::Unsplash,
+            remote_id: &request.id,
+            source_url,
+            thumb_url: &request.thumb_url,
+            author_name: &request.author_name,
+            author_url: &request.author_url,
+            photo_url: &request.photo_url,
+        },
         set_fixed,
     )
+    .map_err(HttpFetchError::terminal)
 }
 
 fn download_palace_wallpaper_internal(
@@ -3245,13 +3729,15 @@ fn download_palace_wallpaper_internal(
         wall_state,
         dir,
         &bytes,
-        WallpaperRemoteSource::Palace,
-        &request.id,
-        source_url,
-        &request.thumb_url,
-        &request.credit_name,
-        &request.credit_url,
-        &request.photo_url,
+        WallpaperDownloadMetadata {
+            source_kind: WallpaperRemoteSource::Palace,
+            remote_id: &request.id,
+            source_url,
+            thumb_url: &request.thumb_url,
+            author_name: &request.credit_name,
+            author_url: &request.credit_url,
+            photo_url: &request.photo_url,
+        },
         set_fixed,
     )
 }
@@ -3338,6 +3824,7 @@ fn try_prefetch_palace_wallpaper(
     allow_download: bool,
     _target_count: usize,
 ) -> Result<PrefetchStats, String> {
+    ensure_palace_wallpaper_source_enabled()?;
     if !allow_download {
         append_wallpaper_log(app, "故宫预取跳过: allow_download=false");
         return Ok(PrefetchStats::default());
@@ -3422,19 +3909,12 @@ fn run_wallpaper_batch(
     let state = app.state::<AppState>();
 
     // 防并发：同一时间只允许一个 batch 在运行
-    if state
-        .batch_in_progress
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
+    let Some(_batch_guard) = BatchInProgressGuard::try_acquire(&state.batch_in_progress) else {
         append_wallpaper_log(app, &format!("批量获取跳过（已有任务在运行）: {}", reason));
         return Ok(PrefetchStats::default());
-    }
+    };
 
-    // 确保无论成功还是失败都释放 batch_in_progress
-    let result = run_wallpaper_batch_inner(app, force, target_count, reason);
-    state.batch_in_progress.store(false, Ordering::SeqCst);
-    result
+    run_wallpaper_batch_inner(app, force, target_count, reason)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3449,7 +3929,6 @@ fn run_wallpaper_batch_inner(
         .wallpaper_lock
         .lock()
         .map_err(|_| "壁纸锁被占用".to_string())?;
-    reset_fallback_depth();
     let dir = ensure_wallpaper_dir(app)?;
     let state_path = dir.join("index.json");
     let mut wall_state = load_wallpaper_state(&state_path);
@@ -3769,6 +4248,7 @@ async fn browse_palace_wallpapers(
     page: usize,
     per_page: usize,
 ) -> Result<RemoteWallpaperSearchResult, String> {
+    ensure_palace_wallpaper_source_enabled()?;
     tauri::async_runtime::spawn_blocking(move || browse_palace_wallpapers_blocking(page, per_page))
         .await
         .map_err(|err| err.to_string())?
@@ -3779,7 +4259,13 @@ async fn refresh_palace_staging_batch(
     app: AppHandle,
     page: Option<usize>,
 ) -> Result<PalaceStagingBatchResult, String> {
+    ensure_palace_wallpaper_source_enabled()?;
+    let state = app.state::<AppState>();
+    let Some(batch_guard) = BatchInProgressGuard::try_acquire(&state.batch_in_progress) else {
+        return Err("已有壁纸批量任务在运行，请稍后再试。".into());
+    };
     tauri::async_runtime::spawn_blocking(move || {
+        let _batch_guard = batch_guard;
         let (dir, wall_state, current_batch) = prepare_palace_staging_refresh(&app)?;
         let target_page = page.unwrap_or(current_batch.page).max(1);
         let stage_dir = palace_staging_dir(&dir);
@@ -3810,11 +4296,13 @@ async fn refresh_palace_staging_batch(
 
 #[tauri::command]
 fn get_palace_staging_batch(app: AppHandle) -> Result<PalaceStagingBatchResult, String> {
+    ensure_palace_wallpaper_source_enabled()?;
     load_palace_staging_batch_result_with_lock(&app)
 }
 
 #[tauri::command]
 fn get_palace_staging_refresh_status(app: AppHandle) -> Result<PalaceStagingRefreshStatus, String> {
+    ensure_palace_wallpaper_source_enabled()?;
     let mut status = current_palace_staging_refresh_status(&app)?;
     let batch = load_palace_staging_batch_result_with_lock(&app)?;
     if status.current_committed_page == 0 || status.state != PalaceStagingRefreshState::Running {
@@ -3834,19 +4322,16 @@ fn start_palace_staging_refresh(
     app: AppHandle,
     page: Option<usize>,
 ) -> Result<PalaceStagingRefreshStatus, String> {
+    ensure_palace_wallpaper_source_enabled()?;
     let existing_status = current_palace_staging_refresh_status(&app)?;
     if existing_status.state == PalaceStagingRefreshState::Running {
         return Ok(existing_status);
     }
 
     let state = app.state::<AppState>();
-    if state
-        .batch_in_progress
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
+    let Some(batch_guard) = BatchInProgressGuard::try_acquire(&state.batch_in_progress) else {
         return Err("已有壁纸批量任务在运行，请稍后再试。".into());
-    }
+    };
     // 重置取消标志，开始新一轮刷新
     state.cancel_refresh.store(false, Ordering::SeqCst);
 
@@ -3865,6 +4350,7 @@ fn start_palace_staging_refresh(
 
     let app_for_task = app.clone();
     tauri::async_runtime::spawn(async move {
+        let _batch_guard = batch_guard;
         let background_result = tauri::async_runtime::spawn_blocking({
             let app_for_block = app_for_task.clone();
             move || {
@@ -3878,10 +4364,6 @@ fn start_palace_staging_refresh(
             }
         })
         .await;
-
-        // 任务完成后释放 batch_in_progress
-        let task_state = app_for_task.state::<AppState>();
-        task_state.batch_in_progress.store(false, Ordering::SeqCst);
 
         match background_result {
             Ok(Ok(batch)) => {
@@ -3941,6 +4423,7 @@ fn start_palace_staging_refresh(
 
 #[tauri::command]
 fn cancel_palace_staging_refresh(app: AppHandle) -> Result<PalaceStagingRefreshStatus, String> {
+    ensure_palace_wallpaper_source_enabled()?;
     let state = app.state::<AppState>();
     state.cancel_refresh.store(true, Ordering::SeqCst);
     let mut status = PalaceStagingRefreshStatus {
@@ -3975,6 +4458,7 @@ async fn promote_palace_staging_wallpaper(
     source_url: String,
     set_fixed: bool,
 ) -> Result<DownloadWallpaperResult, String> {
+    ensure_palace_wallpaper_source_enabled()?;
     tauri::async_runtime::spawn_blocking(move || {
         ensure_palace_refresh_not_running(&app)?;
         let state = app.state::<AppState>();
@@ -4021,6 +4505,7 @@ async fn promote_palace_staging_wallpapers(
     app: AppHandle,
     source_urls: Vec<String>,
 ) -> Result<PalaceStagingBatchResult, String> {
+    ensure_palace_wallpaper_source_enabled()?;
     tauri::async_runtime::spawn_blocking(move || {
         ensure_palace_refresh_not_running(&app)?;
         let state = app.state::<AppState>();
@@ -4261,6 +4746,7 @@ async fn download_palace_wallpaper(
     payload: PalaceDownloadRequest,
     set_fixed: bool,
 ) -> Result<DownloadWallpaperResult, String> {
+    ensure_palace_wallpaper_source_enabled()?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let _guard = state
@@ -4339,39 +4825,156 @@ fn get_lock_wallpaper(
 #[tauri::command]
 fn request_quit(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.allow_exit.store(true, Ordering::SeqCst);
-    let _ = apply_gamma(1.0, 1.0, 1.0);
-    let _ = app.exit(0);
+    restore_display_filter_for_exit(&app, "前端退出请求");
+    app.exit(0);
     Ok(())
+}
+
+fn restore_colors_for_user(app: &AppHandle) -> Result<DisplayFilterStatus, String> {
+    let status = platform::display_filter::restore_color_sync_settings()?;
+    let _ = app.emit("display-filter-status", status.clone());
+    if let Some(store) = app.try_state::<SettingsStore>() {
+        let _guard = SETTINGS_UPDATE_LOCK
+            .lock()
+            .map_err(|_| "设置更新串行锁已损坏".to_string())?;
+        let settings = store
+            .update(|settings| settings.filter_enabled = false)
+            .map_err(|error| error.to_string())?;
+        let _ = app.emit("app-settings-updated", settings);
+    }
+    Ok(status)
+}
+
+fn restore_before_exit(app: &AppHandle) {
+    if let Some(scheduler) = app.try_state::<RestScheduler>() {
+        scheduler.shutdown();
+    }
+    restore_display_filter_for_exit(app, "应用退出事件");
+}
+
+fn restore_display_filter_for_exit(app: &AppHandle, context: &str) {
+    match platform::restore_display_filter() {
+        Ok(status) if !status.failures.is_empty() => append_app_log(
+            app,
+            &format!(
+                "{context}恢复显示颜色部分失败（ColorSync 兜底={}）: {}",
+                status.color_sync_fallback_used,
+                status.failure_summary()
+            ),
+        ),
+        Ok(_) => {}
+        Err(error) => append_app_log(app, &format!("{context}恢复显示颜色失败: {error}")),
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_opener::init());
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    let builder = builder.plugin(tauri_plugin_autostart::init(
+        tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+        Some(vec!["--hidden"]),
+    ));
+
+    let app = builder
+        .manage(LockState::default())
+        .manage(AppState::default())
         .setup(|app| {
+            if let Err(error) = platform::power_events::register() {
+                append_app_log(
+                    app.handle(),
+                    &format!("注册系统唤醒通知失败，将继续使用调度 tick-gap 兜底: {error}"),
+                );
+            }
+            let settings_store = SettingsStore::from_app(app.handle())?;
+            let settings_outcome = settings_store.load_or_recover()?;
+            if settings_outcome.recovered_from.is_some()
+                || settings_outcome.recovery_reason.is_some()
+            {
+                let recovered_from = settings_outcome
+                    .recovered_from
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "未提供恢复路径".to_string());
+                let recovery_reason = settings_outcome
+                    .recovery_reason
+                    .as_deref()
+                    .unwrap_or("未提供损坏原因");
+                append_app_log(
+                    app.handle(),
+                    &format!(
+                        "应用设置已恢复为默认值: reason={recovery_reason}; recovered_from={recovered_from}"
+                    ),
+                );
+            }
+            let settings = settings_outcome.settings;
+            let (scheduler, scheduler_events) =
+                RestScheduler::spawn(SchedulerConfig::from(&settings))?;
+            app.manage(settings_store);
+            app.manage(scheduler);
+            spawn_scheduler_bridge(app.handle().clone(), scheduler_events)
+                .map_err(std::io::Error::other)?;
+
+            #[cfg(target_os = "macos")]
+            if let Err(error) = platform::display_filter::restore_color_sync_settings() {
+                append_app_log(
+                    app.handle(),
+                    &format!("启动时恢复 ColorSync 默认设置失败: {error}"),
+                );
+            }
+            match platform::apply_display_filter(FilterConfig::new(
+                settings.filter_enabled,
+                f64::from(settings.filter_strength),
+                f64::from(settings.color_temperature),
+            )) {
+                Ok(status) if !status.failures.is_empty() => append_app_log(
+                    app.handle(),
+                    &format!("启动时显示滤镜部分失败: {}", status.failure_summary()),
+                ),
+                Ok(_) => {}
+                Err(error) => {
+                    append_app_log(app.handle(), &format!("启动时应用显示滤镜失败: {error}"))
+                }
+            }
+
             let wallpaper_dir = ensure_wallpaper_dir(app.handle())?;
             allow_wallpaper_dir_on_scope(app.handle(), &wallpaper_dir)?;
             // 启动时强制写入壁纸日志，确认目录
             append_wallpaper_log(app.handle(), "应用启动，日志初始化");
+            let start_hidden = env::args_os().any(|argument| argument == "--hidden");
             if let Some(window) = app.get_webview_window("main") {
                 apply_default_window_icon(app.handle(), &window);
                 let _ = window.center();
-                let _ = window.show();
-                let _ = window.set_focus();
+                if !start_hidden {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
             }
             let tray_menu = MenuBuilder::new(app)
                 .text("tray_show", "显示主界面")
                 .text("tray_hide", "隐藏到托盘")
                 .separator()
+                .text("tray_rest", "立即休息")
+                .text("tray_restore_colors", "恢复屏幕原始颜色")
+                .separator()
                 .text("tray_quit", "退出")
                 .build()?;
 
-            let tray = TrayIconBuilder::new()
+            let tray_builder = TrayIconBuilder::new().tooltip("护眼吧").menu(&tray_menu);
+            #[cfg(target_os = "macos")]
+            let tray_builder = tray_builder
+                .icon(MACOS_TRAY_ICON.clone())
+                .icon_as_template(true)
+                .show_menu_on_left_click(true);
+            #[cfg(not(target_os = "macos"))]
+            let tray_builder = tray_builder
                 .icon(TRAY_ICON.clone())
-                .tooltip("护眼吧")
-                .menu(&tray_menu)
-                .show_menu_on_left_click(false)
+                .show_menu_on_left_click(false);
+
+            let tray = tray_builder
                 .on_tray_icon_event(|tray, event| {
                     let app = tray.app_handle();
                     let Some(window) = app.get_webview_window("main") else {
@@ -4383,46 +4986,62 @@ pub fn run() {
                             button_state,
                             ..
                         } => {
-                            if button == MouseButton::Left && button_state == MouseButtonState::Up {
+                            if cfg!(target_os = "windows")
+                                && button == MouseButton::Left
+                                && button_state == MouseButtonState::Up
+                            {
                                 let _ = window.show();
                                 let _ = window.set_focus();
                             }
                         }
-                        TrayIconEvent::DoubleClick { button, .. } => {
-                            if button == MouseButton::Left {
-                                let visible = window.is_visible().unwrap_or(true);
-                                if visible {
-                                    let _ = window.hide();
-                                } else {
-                                    let _ = window.show();
-                                    let _ = window.set_focus();
-                                }
+                        TrayIconEvent::DoubleClick { button, .. }
+                            if cfg!(target_os = "windows") && button == MouseButton::Left =>
+                        {
+                            let visible = window.is_visible().unwrap_or(true);
+                            if visible {
+                                let _ = window.hide();
+                            } else {
+                                let _ = window.show();
+                                let _ = window.set_focus();
                             }
                         }
                         _ => {}
                     }
                 })
-                .on_menu_event(|app, event| {
-                    let Some(window) = app.get_webview_window("main") else {
-                        return;
-                    };
-                    match event.id().as_ref() {
-                        "tray_show" => {
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "tray_show" => {
+                        if let Some(window) = app.get_webview_window("main") {
                             let _ = window.show();
                             let _ = window.set_focus();
                         }
-                        "tray_hide" => {
+                    }
+                    "tray_hide" => {
+                        if let Some(window) = app.get_webview_window("main") {
                             let _ = window.hide();
                         }
-                        "tray_quit" => {
-                            if let Some(state) = app.try_state::<AppState>() {
-                                state.allow_exit.store(true, Ordering::SeqCst);
-                            }
-                            let _ = apply_gamma(1.0, 1.0, 1.0);
-                            app.exit(0);
-                        }
-                        _ => {}
                     }
+                    "tray_rest" => {
+                        if let Some(scheduler) = app.try_state::<RestScheduler>() {
+                            if let Err(error) = scheduler.start_now() {
+                                append_app_log(app, &format!("托盘立即休息失败: {error}"));
+                                let _ = app.emit("rest-scheduler-error", error.to_string());
+                            }
+                        }
+                    }
+                    "tray_restore_colors" => {
+                        if let Err(error) = restore_colors_for_user(app) {
+                            append_app_log(app, &format!("托盘恢复屏幕原始颜色失败: {error}"));
+                            let _ = app.emit("display-filter-error", error);
+                        }
+                    }
+                    "tray_quit" => {
+                        if let Some(state) = app.try_state::<AppState>() {
+                            state.allow_exit.store(true, Ordering::SeqCst);
+                        }
+                        restore_display_filter_for_exit(app, "托盘退出");
+                        app.exit(0);
+                    }
+                    _ => {}
                 })
                 .build(app)?;
 
@@ -4442,25 +5061,37 @@ pub fn run() {
                             return;
                         }
                     }
-                    let _ = apply_gamma(1.0, 1.0, 1.0);
+                    restore_display_filter_for_exit(window.app_handle(), "主窗口退出");
                 }
                 WindowEvent::Destroyed => {
-                    let _ = apply_gamma(1.0, 1.0, 1.0);
+                    if let Some(state) = window.app_handle().try_state::<AppState>() {
+                        if state.allow_exit.load(Ordering::SeqCst) {
+                            restore_display_filter_for_exit(window.app_handle(), "主窗口销毁");
+                        }
+                    }
                 }
                 _ => {}
             }
         })
-        .manage(LockState::default())
-        .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             greet,
             set_gamma,
+            set_gamma_with_status,
             reset_gamma,
+            get_display_filter_status,
+            restore_display_colors,
             show_lock_windows,
             hide_lock_windows,
             broadcast_lock_update,
             get_lock_update,
             lockscreen_action,
+            get_app_settings,
+            update_app_settings,
+            get_scheduler_state,
+            start_rest_now,
+            finish_rest,
+            toggle_rest_pause,
+            restart_rest_cycle,
             get_lock_wallpaper,
             prefetch_lock_wallpaper,
             refresh_lock_wallpaper_now,
@@ -4488,6 +5119,282 @@ pub fn run() {
             request_quit,
             log_app
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app, event| match event {
+        tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
+            restore_before_exit(app);
+        }
+        tauri::RunEvent::Resumed => {
+            if let Err(error) = app.state::<RestScheduler>().reset_after_wake() {
+                let message = format!("唤醒后重置休息周期失败: {error}");
+                append_app_log(app, &message);
+                let _ = app.emit("rest-scheduler-error", message);
+            }
+            if let Ok(status) = platform::reapply_display_filter() {
+                let _ = app.emit("display-filter-status", status);
+            }
+        }
+        _ => {}
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        advance_fallback_depth, choose_online_source, lock_windows_need_rebuild,
+        should_retry_without_proxy, update_app_settings_with_backend, AppSettings,
+        BatchInProgressGuard, HttpFetchError, MonitorSignature, SchedulerConfig,
+        SettingsUpdateBackend, WallpaperRemoteSource, MAX_FALLBACK_CHAIN_DEPTH,
+    };
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    struct FakeSettingsUpdateBackend {
+        persisted: AppSettings,
+        scheduler_config: SchedulerConfig,
+        save_calls: usize,
+        configure_calls: usize,
+        save_fail_before: Vec<usize>,
+        save_fail_after: Vec<usize>,
+        configure_fail_before: Vec<usize>,
+        calls: Vec<&'static str>,
+    }
+
+    impl FakeSettingsUpdateBackend {
+        fn new(settings: AppSettings) -> Self {
+            Self {
+                scheduler_config: SchedulerConfig::from(&settings),
+                persisted: settings,
+                save_calls: 0,
+                configure_calls: 0,
+                save_fail_before: Vec::new(),
+                save_fail_after: Vec::new(),
+                configure_fail_before: Vec::new(),
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    impl SettingsUpdateBackend for FakeSettingsUpdateBackend {
+        fn load_settings(&mut self) -> Result<AppSettings, String> {
+            self.calls.push("load");
+            Ok(self.persisted.clone())
+        }
+
+        fn save_settings(&mut self, settings: &AppSettings) -> Result<(), String> {
+            self.calls.push("save");
+            self.save_calls += 1;
+            if self.save_fail_before.contains(&self.save_calls) {
+                return Err(format!("save failure {}", self.save_calls));
+            }
+            self.persisted = settings.clone();
+            if self.save_fail_after.contains(&self.save_calls) {
+                return Err(format!("save failure {}", self.save_calls));
+            }
+            Ok(())
+        }
+
+        fn configure_scheduler(&mut self, config: SchedulerConfig) -> Result<(), String> {
+            self.calls.push("configure");
+            self.configure_calls += 1;
+            if self.configure_fail_before.contains(&self.configure_calls) {
+                return Err(format!("configure failure {}", self.configure_calls));
+            }
+            self.scheduler_config = config;
+            Ok(())
+        }
+
+        fn query_scheduler_config(&mut self) -> Result<SchedulerConfig, String> {
+            self.calls.push("query");
+            Ok(self.scheduler_config)
+        }
+    }
+
+    fn changed_app_settings() -> AppSettings {
+        AppSettings {
+            filter_strength: 55,
+            work_interval_minutes: 45,
+            rest_duration_seconds: 90,
+            allow_esc: false,
+            ..AppSettings::default()
+        }
+    }
+
+    #[test]
+    fn batch_guard_releases_the_flag_on_early_return() {
+        fn fail_after_acquire(flag: &Arc<AtomicBool>) -> Result<(), &'static str> {
+            let _guard = BatchInProgressGuard::try_acquire(flag).ok_or("busy")?;
+            Err("initialization failed")
+        }
+
+        let flag = Arc::new(AtomicBool::new(false));
+        assert_eq!(fail_after_acquire(&flag), Err("initialization failed"));
+        assert!(!flag.load(Ordering::SeqCst));
+        assert!(BatchInProgressGuard::try_acquire(&flag).is_some());
+    }
+
+    #[test]
+    fn batch_guard_rejects_a_concurrent_owner() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let first = BatchInProgressGuard::try_acquire(&flag).expect("first owner");
+        assert!(BatchInProgressGuard::try_acquire(&flag).is_none());
+        drop(first);
+        assert!(BatchInProgressGuard::try_acquire(&flag).is_some());
+    }
+
+    #[test]
+    fn fallback_depth_is_request_scoped_input() {
+        assert_eq!(advance_fallback_depth(0), Some(1));
+        assert_eq!(
+            advance_fallback_depth(MAX_FALLBACK_CHAIN_DEPTH - 1),
+            Some(MAX_FALLBACK_CHAIN_DEPTH)
+        );
+        assert_eq!(advance_fallback_depth(MAX_FALLBACK_CHAIN_DEPTH), None);
+        assert_eq!(advance_fallback_depth(u32::MAX), None);
+    }
+
+    #[test]
+    fn disabled_palace_source_never_becomes_the_automatic_fallback() {
+        assert_eq!(
+            choose_online_source(false, false),
+            WallpaperRemoteSource::Unsplash
+        );
+        assert_eq!(
+            choose_online_source(false, true),
+            WallpaperRemoteSource::Palace
+        );
+        assert_eq!(
+            choose_online_source(true, true),
+            WallpaperRemoteSource::Unsplash
+        );
+    }
+
+    #[test]
+    fn business_http_status_does_not_trigger_transport_fallback() {
+        let not_found =
+            HttpFetchError::http_status(reqwest::StatusCode::NOT_FOUND, "deterministic response");
+        let rate_limited = HttpFetchError::http_status(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "deterministic response",
+        );
+        assert!(!should_retry_without_proxy(&not_found));
+        assert!(!should_retry_without_proxy(&rate_limited));
+    }
+
+    #[test]
+    fn proxy_and_server_http_statuses_continue_the_fallback_chain() {
+        for status in [
+            reqwest::StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+            reqwest::StatusCode::BAD_GATEWAY,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            reqwest::StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            let error = HttpFetchError::http_status(status, "retryable response");
+            assert!(should_retry_without_proxy(&error), "status={status}");
+        }
+    }
+
+    #[test]
+    fn lock_windows_compare_topology_and_live_window_count() {
+        let created: MonitorSignature = vec![(0, 0, 1920, 1080, 1.0_f64.to_bits())];
+        let unchanged = created.clone();
+        let changed = vec![
+            (0, 0, 1920, 1080, 1.0_f64.to_bits()),
+            (1920, 0, 2560, 1440, 2.0_f64.to_bits()),
+        ];
+
+        assert!(!lock_windows_need_rebuild(Some(&created), &unchanged, 1, 1));
+        assert!(lock_windows_need_rebuild(Some(&created), &changed, 1, 1));
+        assert!(lock_windows_need_rebuild(Some(&created), &unchanged, 1, 0));
+        assert!(lock_windows_need_rebuild(Some(&created), &unchanged, 0, 0));
+        assert!(!lock_windows_need_rebuild(None, &changed, 0, 0));
+    }
+
+    #[test]
+    fn settings_update_persists_before_configuring_the_scheduler() {
+        let previous = AppSettings::default();
+        let next = changed_app_settings();
+        let mut backend = FakeSettingsUpdateBackend::new(previous);
+
+        update_app_settings_with_backend(&mut backend, &next).expect("update settings");
+
+        assert_eq!(backend.persisted, next);
+        assert_eq!(backend.scheduler_config, SchedulerConfig::from(&next));
+        assert_eq!(backend.calls, ["load", "save", "configure"]);
+    }
+
+    #[test]
+    fn settings_save_failure_after_replace_is_rolled_back_and_verified() {
+        let previous = AppSettings::default();
+        let next = changed_app_settings();
+        let mut backend = FakeSettingsUpdateBackend::new(previous.clone());
+        backend.save_fail_after = vec![1];
+
+        let error =
+            update_app_settings_with_backend(&mut backend, &next).expect_err("save must fail");
+
+        assert_eq!(backend.persisted, previous);
+        assert_eq!(
+            backend.scheduler_config,
+            SchedulerConfig::from(&AppSettings::default())
+        );
+        assert_eq!(backend.calls, ["load", "save", "save", "load"]);
+        assert_eq!(
+            error,
+            "保存应用设置失败: save failure 1；已验证设置文件恢复到更新前状态"
+        );
+    }
+
+    #[test]
+    fn scheduler_failure_rolls_back_and_verifies_both_resources() {
+        let previous = AppSettings::default();
+        let next = changed_app_settings();
+        let mut backend = FakeSettingsUpdateBackend::new(previous.clone());
+        backend.configure_fail_before = vec![1];
+
+        let error =
+            update_app_settings_with_backend(&mut backend, &next).expect_err("configure must fail");
+
+        assert_eq!(backend.persisted, previous.clone());
+        assert_eq!(backend.scheduler_config, SchedulerConfig::from(&previous));
+        assert_eq!(
+            backend.calls,
+            [
+                "load",
+                "save",
+                "configure",
+                "save",
+                "load",
+                "configure",
+                "query"
+            ]
+        );
+        assert_eq!(
+            error,
+            "更新休息调度失败: configure failure 1；已验证设置文件和休息调度配置恢复到更新前状态"
+        );
+    }
+
+    #[test]
+    fn rollback_failures_are_combined_without_masking_the_primary_error() {
+        let previous = AppSettings::default();
+        let next = changed_app_settings();
+        let mut backend = FakeSettingsUpdateBackend::new(previous);
+        backend.save_fail_before = vec![2];
+        backend.configure_fail_before = vec![1, 2];
+
+        let error =
+            update_app_settings_with_backend(&mut backend, &next).expect_err("configure must fail");
+
+        assert_eq!(backend.persisted, next);
+        assert!(error.starts_with("更新休息调度失败: configure failure 1"));
+        assert!(error.contains("设置文件和休息调度配置回滚未完全成功"));
+        assert!(error.contains("恢复设置文件写入失败: save failure 2"));
+        assert!(error.contains("恢复设置文件后读取验证不一致"));
+        assert!(error.contains("恢复休息调度配置失败: configure failure 2"));
+    }
 }
